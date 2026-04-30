@@ -91,10 +91,14 @@ def main():
         if frac > 0.02:
             raise SystemExit(f"ACCURACY FAIL: {frac:.2%} > 2.0% threshold")
 
-    # Bench torch reference
-    torch_ms = _bench(torch_assign, x, centroids, x_sq, c_sq, rounds=args.rounds)
-    # Bench ours
-    ours_ms = _bench(euclid_assign, x, centroids, x_sq, c_sq, rounds=args.rounds)
+    # Take median of 5 outer runs to dampen GPU thermal/launch noise.
+    import statistics
+    ours_runs = [_bench(euclid_assign, x, centroids, x_sq, c_sq, rounds=args.rounds)
+                 for _ in range(5)]
+    torch_runs = [_bench(torch_assign, x, centroids, x_sq, c_sq, rounds=args.rounds)
+                  for _ in range(5)]
+    ours_ms = statistics.median(ours_runs)
+    torch_ms = statistics.median(torch_runs)
 
     speedup = torch_ms / ours_ms
     flops = 2.0 * B * N * K * D
@@ -102,7 +106,8 @@ def main():
     torch_tflops = flops / (torch_ms * 1e-3) / 1e12
 
     print(f"shape: B={B} N={N} K={K} D={D} dtype=fp16")
-    print(f"  ours:   {ours_ms:7.4f} ms ({our_tflops:6.2f} TFLOPS)")
+    print(f"  ours runs:  {[f'{m:.3f}' for m in ours_runs]}")
+    print(f"  ours:   {ours_ms:7.4f} ms ({our_tflops:6.2f} TFLOPS)  median of 5")
     print(f"  torch:  {torch_ms:7.4f} ms ({torch_tflops:6.2f} TFLOPS)")
     print(f"speedup: {ours_ms:.4f} {torch_ms:.4f} {speedup:.3f}")
 
