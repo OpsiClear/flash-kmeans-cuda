@@ -266,7 +266,10 @@ assign_sm80_kernel(
 
     // Cache per-thread x_sq values + row validity in registers. Each thread
     // owns M_ATOMS_PER_WARP * 2 distinct rows. Loading once here avoids
-    // num_k_chunks SMEM reads per row in the epilogue. Per-tile state.
+    // num_k_chunks SMEM reads per row in the epilogue. NOTE: hoisting these
+    // earlier (before the priming) regressed ~2% on mega — the gmem reads
+    // compete with cp.async issues for memory subsystem bandwidth. Keep
+    // them after the wait+sync.
     float xs_top_cache[M_ATOMS_PER_WARP];
     float xs_bot_cache[M_ATOMS_PER_WARP];
     bool top_valid_cache[M_ATOMS_PER_WARP];
@@ -277,8 +280,6 @@ assign_sm80_kernel(
       int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
       top_valid_cache[m] = row_top < n_count;
       bot_valid_cache[m] = row_bot < n_count;
-      // Read x_sq from gmem directly (it's small and read once); avoids the
-      // detour through SMEM for x_sq_smem.
       xs_top_cache[m] = top_valid_cache[m]
           ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
       xs_bot_cache[m] = bot_valid_cache[m]
@@ -612,6 +613,7 @@ void launch_assign_sm80(const at::Tensor& x,
   size_t smem_widek128_2stage = compute_smem_bytes(128, 128, D, 2, elt_sz);
   size_t smem_widek96_2stage = compute_smem_bytes(128, 96, D, 2, elt_sz);
   size_t smem_narrow_4stage = compute_smem_bytes(64, 64, D, 4, elt_sz);
+  size_t smem_narrowk32_2stage = compute_smem_bytes(64, 32, D, 2, elt_sz);
   size_t smem_wide_3stage = compute_smem_bytes(128, 64, D, 3, elt_sz);
   size_t smem_wide_2stage = compute_smem_bytes(128, 64, D, 2, elt_sz);
   size_t smem_deep_2stage = compute_smem_bytes(64, 128, D, 2, elt_sz);
@@ -682,6 +684,25 @@ void launch_assign_sm80(const at::Tensor& x,
                                   B, N, K, D, stream);
     return true;
   };
+  // BLOCK_N=64, BLOCK_K=32, 4 warps, 2 stages — small enough (~34 KB) for
+  // 2 CTAs/SM on Ada (100 KB / SM). Total 8 warps/SM = 2 warps/scheduler,
+  // same as 8w 1-CTA but with INDEPENDENT CTAs (no shared __syncthreads),
+  // closer to Triton's BN=128 BK=32 num_warps=4 num_stages=1 autotune for
+  // K >= 2K. Set FKC_NARROW=1 to force this path.
+  auto try_launch_narrowk32_2_w4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed<T, 64, 32, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                  B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n2 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed<T, 64, 32, 4, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                     B, N, K, D, stream);
+    return true;
+  };
   auto try_launch_wide_3_w8 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
@@ -749,6 +770,24 @@ void launch_assign_sm80(const at::Tensor& x,
     return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0);
   }();
 
+  // 4-warp wide tile experiment knob. FKC_W4=1 forces BN=128 BK=64 4w
+  // 2-stage instead of the 8w default. Halves warps/CTA → 2 atoms per warp
+  // (M_ATOMS=2) and longer mma queue per warp; closer to Triton's
+  // num_warps=4 autotune choice for K>=2K.
+  static const bool force_w4_env = []() {
+    const char* s = std::getenv("FKC_W4");
+    return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0);
+  }();
+
+  // 2-CTAs/SM narrow tile knob. FKC_NARROW=1 forces BN=64 BK=32 4w 2-stage
+  // (~34 KB SMEM/CTA fits 2 CTAs/SM on Ada, vs current 87 KB → 1 CTA/SM).
+  // Effective warps/SM identical (8) but split across 2 independent CTAs
+  // — cuts the inter-K-chunk barrier serialization that 8w 1-CTA suffers.
+  static const bool force_narrow_env = []() {
+    const char* s = std::getenv("FKC_NARROW");
+    return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0);
+  }();
+
   bool launched = false;
   if (force_deep_env) {
     if (x.scalar_type() == at::kHalf)             launched = try_launch_deep_2_w4(__half{});
@@ -757,6 +796,16 @@ void launch_assign_sm80(const at::Tensor& x,
     auto run = [&](auto t) {
       using T = decltype(t);
       if (prefer_w8) {
+        if (force_narrow_env) {
+          if (n_tiles_env >= 2) {
+            if (try_launch_narrowk32_2_w4_n2(t)) return true;
+          }
+          if (try_launch_narrowk32_2_w4(t)) return true;
+        }
+        if (force_w4_env) {
+          if (try_launch_wide_3_w4(t))      return true;
+          if (try_launch_wide_2_w4(t))      return true;
+        }
         if (force_wide3_env) {
           if (n_tiles_env >= 2) {
             if (try_launch_wide_3_w8_n2(t)) return true;
