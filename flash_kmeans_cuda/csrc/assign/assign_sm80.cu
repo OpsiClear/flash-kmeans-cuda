@@ -486,10 +486,13 @@ assign_sm80_kernel(
   }
 
   // Drain ALL cp.async groups before next n_tile. The K-chunk loop's
-  // prefetch leaves up to PIPE_STAGES-1 trailing groups in flight; if we
-  // don't drain, the next tile's wait_group<PIPE_STAGES-1> would over-count
-  // them and start computing on stale c_smem. __syncthreads() ensures all
-  // warps reach the drain together (cp.async.wait_all is per-warp).
+  // prefetch leaves up to PIPE_STAGES-1 trailing groups in flight, plus
+  // this tile's x_smem' prefetch. Without draining, the next tile's
+  // wait_group<PIPE_STAGES-1> drops the right count of groups but the HW
+  // re-orders work in a way that ends up slower (~10% on mega) than
+  // explicitly waiting here. Likely related to cp.async resource
+  // accounting in the SM. __syncthreads() ensures all warps reach the
+  // drain together (cp.async.wait_all is per-warp).
   if (N_TILES_PER_CTA > 1) {
     ptx::cp_async_wait_all();
     __syncthreads();
