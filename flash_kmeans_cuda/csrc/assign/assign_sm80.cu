@@ -236,9 +236,18 @@ assign_sm80_kernel(
       async_load_tile<T, THREADS_PER_CTA>(c_dst,
                          centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
                          k_count, BLOCK_K, D, D_SMEM);
+      // Vectorize the c_sq scalar copy: each thread writes 4 floats (16B)
+      // per pass. Aligned ok because BLOCK_K is a multiple of 4 and the
+      // per-stage SMEM offset is also 16B-aligned.
       const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
-      for (int i = tid; i < BLOCK_K; i += THREADS_PER_CTA) {
-        csq_dst[i] = (i < k_count) ? csq_src[i] : 0.f;
+      static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for vectorized csq copy");
+      for (int i = tid * 4; i < BLOCK_K; i += THREADS_PER_CTA * 4) {
+        float4 v;
+        v.x = (i + 0 < k_count) ? csq_src[i + 0] : 0.f;
+        v.y = (i + 1 < k_count) ? csq_src[i + 1] : 0.f;
+        v.z = (i + 2 < k_count) ? csq_src[i + 2] : 0.f;
+        v.w = (i + 3 < k_count) ? csq_src[i + 3] : 0.f;
+        *reinterpret_cast<float4*>(&csq_dst[i]) = v;
       }
       ptx::cp_async_commit();
     };
