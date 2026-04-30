@@ -765,6 +765,10 @@ void launch_assign_sm80(const at::Tensor& x,
         }
         // Default (n_tiles_env=2) tries the N_TILES=2 wide variants first;
         // falls through to N_TILES=1 path on SMEM miss or when env forces 1.
+        // BK=112 (intermediate, fits SMEM where 128 doesn't) was tested
+        // and regressed 16% on mega vs BK=96 — register pressure from 14
+        // N-atoms × 2 acc regs + 14 B regs / thread tipped past nvcc's
+        // sweet spot. Reverted; left history in commit.
         if (n_tiles_env == 2) {
           if (try_launch_widek128_2_w8_n2(t)) return true;
           if (try_launch_widek96_2_w8_n2(t))  return true;
