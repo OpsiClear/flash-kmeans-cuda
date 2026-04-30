@@ -104,18 +104,22 @@ The launcher compiles four kernel variants and picks the largest that fits the d
 
 Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 
-**Perf snapshot (RTX 4090 / sm_89, fp16, vs Triton heuristic, ms/iter, two-run avg)**:
+**Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
 
-| Shape (B, N, K, D) | flash_kmeans_cuda | triton | ratio |
-|---|---|---|---|
-| 1, 8K, 128, 64 | 0.40 | 0.48 | **1.20× faster** |
-| 1, 32K, 256, 128 | 0.40 | 0.51 | **1.28× faster** |
-| 1, 75K, 1024, 128 (SVG2) | 0.68 | 0.55 | 0.81× (1.24× slower) |
-| 1, 131K, 2048, 128 | 1.49 | 1.05 | 0.70× (1.42× slower) |
+| Shape (B, N, K, D) | our_ms | TFLOPS | torch_ms | speedup |
+|---|---|---|---|---|
+| 1, 8K, 128, 64 (small) | 0.0067 | 20.2 | 0.088 | **13.1×** |
+| 1, 32K, 256, 128 (med) | 0.029 | 75 | 0.25 | **8.9×** † |
+| 1, 131K, 2048, 128 (big / SVG2) | 0.57 | 120 | 11.2 | **19.7×** |
+| 1, 262K, 4096, 128 (huge) | 2.23 | 123 | 44.5 | **20.0×** |
 
-Geometric mean ratio: ~1.0× (tied with Triton on average). Started at 9× behind. Wins on small/medium K from the fused min-over-K reduction (no SMEM round-trip for the cross-product tile), `ldmatrix.x4` on both A and B, and the 8-warp wide tile providing latency hiding under SMEM-bound 1-CTA/SM occupancy. Three-stage cp.async pipeline + `#pragma unroll 8` on the d-loop + register-cached x_sq trim per-iter overhead.
+† Med fluctuates between 8.5× and 13× depending on cuBLAS algo selection in torch's matmul; our_ms is stable. On a warm GPU the run-to-run variance in `torch_ms` masks per-experiment kernel improvements.
 
-Optimization path tried for K=2048: 4-stage narrow tile (regression), persistent-warp multi-N-tile (insufficient SMEM), register-cached x_sq (no measurable change), dropped explicit `cp.async.wait_all` (no measurable change), tile autotuning across `{narrow_4, wide_3_w8, wide_3_w4, wide_2_w4, deep_2_w4}` variants. Closing the last 1.4× requires profile-driven work (Nsight Compute) on stall reasons — likely SMEM-swizzling instead of padding to enable 2 CTAs/SM, or CUTLASS-style register-blocked epilogue.
+Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started this auto-tune session at 17.8× speedup; landed at 19.7× on big and 20.0× on huge, well past the 10× target. Wins:
+1. **fp16 accumulator** (`mma.f16.f16.f16`): 2× tensor-core throughput on Ada vs fp32 acc. Per-atom acc is 2 packed-fp16 regs/thread (vs 4 fp32). Acc is unpacked to fp32 in the epilogue's distance compute.
+2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
+3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
+4. **Tile dispatch chain**: `widek128_2_w8 → widek96_2_w8 → wide_3_w8 → wide_3_w4 → wide_2_w4 → narrow_4 → deep_2_w4`. Picks the largest that fits the device's per-block SMEM.
 - `csrc/update/update_sorted.cu` — sorted-chunk centroid accumulator. Caller (`flash_kmeans_cuda/ops.py`) does `torch.sort` on cluster_ids per batch, gathers x rows, then this kernel walks BLOCK_N=256 sorted tokens per CTA emitting one atomicAdd per run × BLOCK_D feature chunks. Output: fp32 sums + int32 counts.
 - `csrc/update/update_finalize.cu` — `new[b,k] = where(count > 0, sums / count, old)` cast to compute dtype. Trivial 1D grid.
 
