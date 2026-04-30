@@ -144,5 +144,30 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
 #endif
 }
 
+// fp16-accumulator variant: 2× throughput on Ada (8 cycles vs 16 for fp32 acc).
+// Per thread: D = 2 u32 regs each holding 2 fp16 values.
+//   d0_packed: D[m=lane/4, n=2*(lane%4)..+1]
+//   d1_packed: D[m=lane/4+8, n=2*(lane%4)..+1]
+__device__ __forceinline__ void mma_m16n8k16_fp16_acc_fp16(
+    uint32_t& d0, uint32_t& d1,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    uint32_t c0, uint32_t c1) {
+#if FKC_HAS_MMA_SYNC_FP16
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16\n"
+      "  {%0, %1},\n"
+      "  {%2, %3, %4, %5},\n"
+      "  {%6, %7},\n"
+      "  {%8, %9};\n"
+      : "=r"(d0), "=r"(d1)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+        "r"(b0), "r"(b1),
+        "r"(c0), "r"(c1));
+#else
+  d0 = c0; d1 = c1;
+#endif
+}
+
 }  // namespace ptx
 }  // namespace fkc

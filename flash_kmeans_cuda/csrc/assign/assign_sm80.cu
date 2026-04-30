@@ -75,29 +75,46 @@ constexpr int BLOCK_D = 16;
 // offsets land on distinct 4-byte banks.
 constexpr int SMEM_PAD = 8;
 
+// FP16 accumulator path (2x mma throughput on Ada vs fp32 acc).
+// Per atom: 2 packed-fp16 regs/thread instead of 4 fp32. Only fp16 input
+// supports fp16 acc; bf16 input must use fp32 acc.
 template <typename T>
 __device__ __forceinline__ void mma_atom(
-    float& d0, float& d1, float& d2, float& d3,
+    uint32_t& d0, uint32_t& d1,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1,
-    float c0, float c1, float c2, float c3);
+    uint32_t c0, uint32_t c1);
 
 template <>
 __device__ __forceinline__ void mma_atom<__half>(
-    float& d0, float& d1, float& d2, float& d3,
+    uint32_t& d0, uint32_t& d1,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1,
-    float c0, float c1, float c2, float c3) {
-  ptx::mma_m16n8k16_fp16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+    uint32_t c0, uint32_t c1) {
+  ptx::mma_m16n8k16_fp16_acc_fp16(d0, d1, a0, a1, a2, a3, b0, b1, c0, c1);
 }
 
+// bf16 input falls back to fp32 acc — bf16 acc isn't supported by mma.sync.
+// We bridge via a temporary fp32 path: convert acc-as-fp16 to fp32, run fp32-acc
+// mma, convert back. (Not great; for now, route bf16 through this kernel only
+// when the launcher dispatches it; or use a separate kernel template for bf16.)
 template <>
 __device__ __forceinline__ void mma_atom<__nv_bfloat16>(
-    float& d0, float& d1, float& d2, float& d3,
+    uint32_t& d0, uint32_t& d1,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1,
-    float c0, float c1, float c2, float c3) {
-  ptx::mma_m16n8k16_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+    uint32_t c0, uint32_t c1) {
+  // Unpack fp16 acc -> fp32, mma, repack. This is a transitional path.
+  __half2 c0h = *reinterpret_cast<const __half2*>(&c0);
+  __half2 c1h = *reinterpret_cast<const __half2*>(&c1);
+  float f0 = __half2float(c0h.x), f1 = __half2float(c0h.y);
+  float f2 = __half2float(c1h.x), f3 = __half2float(c1h.y);
+  float r0, r1, r2, r3;
+  ptx::mma_m16n8k16_bf16(r0, r1, r2, r3, a0, a1, a2, a3, b0, b1, f0, f1, f2, f3);
+  __half2 r0h = __floats2half2_rn(r0, r1);
+  __half2 r1h = __floats2half2_rn(r2, r3);
+  d0 = *reinterpret_cast<const uint32_t*>(&r0h);
+  d1 = *reinterpret_cast<const uint32_t*>(&r1h);
 }
 
 // Issue cp.async copies for one tile of rows_max × D fp16 elts. SMEM is
@@ -253,15 +270,17 @@ assign_sm80_kernel(
     T* c_tile = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
     float* c_sq_tile = c_sq_smem + stage * BLOCK_K;
 
-    // Per-warp accumulator: [M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][4 fp32 regs/thread].
-    float acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][4];
+    // Per-warp accumulator: [M_ATOMS][N_ATOMS][2] packed fp16 regs/thread.
+    // Each u32 reg holds 2 fp16 values: d0 = (top-row col0, top-row col1),
+    // d1 = (bot-row col0, bot-row col1).
+    uint32_t acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][2];
     #pragma unroll
     for (int m = 0; m < M_ATOMS_PER_WARP; ++m)
       #pragma unroll
-      for (int n = 0; n < N_ATOMS_PER_WARP; ++n)
-        #pragma unroll
-        for (int r = 0; r < 4; ++r)
-          acc[m][n][r] = 0.f;
+      for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+        acc[m][n][0] = 0u;
+        acc[m][n][1] = 0u;
+      }
 
     // Walk D in BLOCK_D=16 steps; each step does one mma per (m, n) atom.
     // Unroll up to 8 iters (covers D=64/128); for larger D the compiler
@@ -316,16 +335,16 @@ assign_sm80_kernel(
         b_regs[n + 1][1] = r3;     // atom n+1, K-half 1 (b1)
       }
 
-      // ----- Issue mma atoms -----
+      // ----- Issue mma atoms (fp16 acc) -----
       #pragma unroll
       for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
         #pragma unroll
         for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
           mma_atom<T>(
-              acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
+              acc[m][n][0], acc[m][n][1],
               a_regs[m][0], a_regs[m][1], a_regs[m][2], a_regs[m][3],
               b_regs[n][0], b_regs[n][1],
-              acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3]);
+              acc[m][n][0], acc[m][n][1]);
         }
       }
     }  // d-loop
@@ -350,23 +369,33 @@ assign_sm80_kernel(
         float cs0 = c_sq_tile[k_in_chunk_0];
         float cs1 = c_sq_tile[k_in_chunk_1];
 
+        // Unpack fp16-packed acc into 4 fp32 cross-product values.
+        // acc[m][n][0] = (top row col0 fp16, top row col1 fp16)
+        // acc[m][n][1] = (bot row col0 fp16, bot row col1 fp16)
+        __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
+        __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
+        float a_top0 = __low2float(packed_top);
+        float a_top1 = __high2float(packed_top);
+        float a_bot0 = __low2float(packed_bot);
+        float a_bot1 = __high2float(packed_bot);
+
         if (top_valid) {
           if (k0_valid) {
-            float d = to_dist(acc[m][n][0], xs_top, cs0);
+            float d = to_dist(a_top0, xs_top, cs0);
             update_best(best[m * 2 + 0], d, k_global_0);
           }
           if (k1_valid) {
-            float d = to_dist(acc[m][n][1], xs_top, cs1);
+            float d = to_dist(a_top1, xs_top, cs1);
             update_best(best[m * 2 + 0], d, k_global_1);
           }
         }
         if (bot_valid) {
           if (k0_valid) {
-            float d = to_dist(acc[m][n][2], xs_bot, cs0);
+            float d = to_dist(a_bot0, xs_bot, cs0);
             update_best(best[m * 2 + 1], d, k_global_0);
           }
           if (k1_valid) {
-            float d = to_dist(acc[m][n][3], xs_bot, cs1);
+            float d = to_dist(a_bot1, xs_bot, cs1);
             update_best(best[m * 2 + 1], d, k_global_1);
           }
         }
