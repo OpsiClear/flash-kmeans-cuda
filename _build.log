@@ -1,7 +1,7 @@
 warning: Missing version constraint (e.g., a lower bound) for `pytest`
 warning: Missing version constraint (e.g., a lower bound) for `flash-kmeans`
-Resolved 12 packages in 378ms
-Prepared 1 package in 2m 26s
-Uninstalled 1 package in 8ms
-Installed 1 package in 6ms
+Resolved 12 packages in 285ms
+Prepared 1 package in 1m 54s
+Uninstalled 1 package in 2ms
+Installed 1 package in 5ms
  ~ flash-kmeans-cuda==0.1.0 (from file:///C:/Users/HEQ/Projects/flash-kmeans-cuda)

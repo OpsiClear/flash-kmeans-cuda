@@ -18,8 +18,14 @@ def _euclid_iter(
     x: torch.Tensor,
     x_sq: torch.Tensor,
     centroids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One assign+update+finalize+shift step. Returns (new_centroids, shift, cluster_ids).
+    *,
+    compute_shift: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """One assign+update+finalize step. Returns (new_centroids, shift, cluster_ids).
+
+    When ``compute_shift=False`` the shift is None — saves a fp32 cast +
+    norm + reduction per iter, which adds up at large K (the cast alone
+    materializes a (B, K, D) fp32 buffer twice the size of centroids).
 
     Both `centroids` and the returned `new_centroids` are in compute dtype.
     """
@@ -30,7 +36,9 @@ def _euclid_iter(
     sums, counts = centroid_update_sorted(x, cluster_ids, K)
     new_centroids = centroid_finalize(sums, counts, centroids)
 
-    shift = (new_centroids.float() - centroids.float()).norm(dim=-1).max()
+    shift = None
+    if compute_shift:
+        shift = (new_centroids.float() - centroids.float()).norm(dim=-1).max()
     return new_centroids, shift, cluster_ids
 
 
@@ -86,13 +94,18 @@ def batch_kmeans_Euclid(
     cluster_ids = torch.empty(
         (B, N), device=x.device, dtype=torch.int32
     )
+    # Skip shift compute when tol<=0 and not verbose: tol=0 means "always run
+    # to max_iters" so the shift result is unused. Eliminates a (B,K,D) fp32
+    # cast + norm + max + .item() sync per iter — significant at large K.
+    need_shift = tol > 0 or verbose
     n_iters_run = 0
     for it in range(max_iters):
-        new_centroids, shift, cluster_ids = _euclid_iter(x, x_sq, centroids)
+        new_centroids, shift, cluster_ids = _euclid_iter(
+            x, x_sq, centroids, compute_shift=need_shift)
         n_iters_run = it + 1
         if verbose:
             print(f"Iter {it}, center shift: {shift.item():.6f}")
-        if shift.item() < tol:
+        if need_shift and shift.item() < tol:
             centroids = new_centroids
             break
         centroids = new_centroids
