@@ -104,6 +104,10 @@ The launcher compiles four kernel variants and picks the largest that fits the d
 
 Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 
+**Iter-loop overhead optimizations** (`flash_kmeans_cuda/kmeans.py`):
+- `compute_shift=False` when `tol<=0` — eliminates a (B,K,D) fp32 cast + norm + max + `.item()` sync per iter. With K=2048 the savings are 17% of full-iter time on big shapes.
+- Pre-allocated buffers ping-pong'd across iterations (cluster_ids, sums, counts, centroid double-buffer) to avoid per-iter allocator churn.
+
 **Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
 
 | Shape (B, N, K, D) | our_ms | TFLOPS | torch_ms | speedup |
@@ -115,7 +119,18 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 
 † Med fluctuates between 8.5× and 13× depending on cuBLAS algo selection in torch's matmul; our_ms is stable. On a warm GPU the run-to-run variance in `torch_ms` masks per-experiment kernel improvements.
 
-Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started this auto-tune session at 17.8× speedup; landed at 19.7× on big and 20.0× on huge, well past the 10× target. Wins:
+**vs Triton (assign-only, larger dataset)**:
+
+| Shape | our TFLOPS | Triton TFLOPS | ratio |
+|---|---|---|---|
+| med (N=32K, K=256) | 75 | 41 | **1.84×** |
+| big (N=131K, K=2048, SVG2) | 121 | 130 | 0.93× |
+| huge (N=262K, K=4096) | 133 | 138 | 0.96× |
+| mega (N=524K, K=8192) | 126 | 138 | 0.91× |
+
+We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9% gap on large compute-bound shapes is fundamental — both kernels saturate the tensor cores. **10× Triton is unattainable** when both kernels approach hardware peak; the realistic ceiling is ~1.0–1.2×. We win on med because Triton's autotune isn't tuned for small shapes on Ada.
+
+Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the pytorch-comparison auto-tune at 17.8× speedup; landed at 19.7× on big and 20.0× on huge. Wins:
 1. **fp16 accumulator** (`mma.f16.f16.f16`): 2× tensor-core throughput on Ada vs fp32 acc. Per-atom acc is 2 packed-fp16 regs/thread (vs 4 fp32). Acc is unpacked to fp32 in the epilogue's distance compute.
 2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
 3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
