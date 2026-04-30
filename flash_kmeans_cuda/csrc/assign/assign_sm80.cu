@@ -217,11 +217,16 @@ assign_sm80_kernel(
       best[i] = Best{FLT_MAX, 0};
     }
 
-    // Load x_tile (CTA-wide). Issued once per n_tile.
-    async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                       x + (size_t)pid_b * N * D + (size_t)n_start * D,
-                       n_count, BLOCK_N, D, D_SMEM);
-    ptx::cp_async_commit();
+    // Load x_tile (CTA-wide). For tile 0 we load fresh; for subsequent
+    // tiles the load was already issued by the previous tile's epilogue
+    // and made visible by the inter-tile cp_async_wait_all + __syncthreads,
+    // so we skip — saves the latency of an extra cp.async + sync pair.
+    if (n_tile == 0) {
+      async_load_tile<T, THREADS_PER_CTA>(x_smem,
+                         x + (size_t)pid_b * N * D + (size_t)n_start * D,
+                         n_count, BLOCK_N, D, D_SMEM);
+      ptx::cp_async_commit();
+    }
 
     auto issue_c_chunk = [&](int chunk_idx, int stage) {
       int k_start = chunk_idx * BLOCK_K;
@@ -245,7 +250,8 @@ assign_sm80_kernel(
     }
 
     // Wait for x_tile + first c chunk (i.e., everything but the last
-    // outstanding group).
+    // outstanding group). x_smem is only in pending for tile 0; for n>0
+    // it was drained in the prior tile's wait_all so we just wait for c.
     ptx::cp_async_wait_group<PIPE_STAGES - 1>();
     __syncthreads();
 
@@ -418,6 +424,28 @@ assign_sm80_kernel(
       __syncthreads();
     }
   }  // k-chunk loop
+
+  // ----- Inter-tile prefetch: issue NEXT tile's x_smem load now -----
+  // x_smem is no longer read by this tile (K-loop done; reduce + cluster_ids
+  // write below are register-only / output-only). Issuing the prefetch here
+  // lets the cp.async overlap with the warp-shfl reductions and the
+  // cluster_ids store, hiding the load latency from the next tile's
+  // critical path. The drain below (wait_all + sync) makes it visible.
+  //
+  // We need a CTA sync before issuing because cp.async writes are async and
+  // could land before all warps finish their last ldmatrix on the old
+  // x_smem rows — without sync that's a write-during-read race.
+  if (N_TILES_PER_CTA > 1 && (n_tile + 1) < N_TILES_PER_CTA) {
+    int n_start_next = (blockIdx.x * N_TILES_PER_CTA + n_tile + 1) * BLOCK_N;
+    int n_count_next = min(BLOCK_N, N - n_start_next);
+    if (n_count_next > 0) {
+      __syncthreads();
+      async_load_tile<T, THREADS_PER_CTA>(x_smem,
+                         x + (size_t)pid_b * N * D + (size_t)n_start_next * D,
+                         n_count_next, BLOCK_N, D, D_SMEM);
+      ptx::cp_async_commit();
+    }
+  }
 
   // ----- Reduce best[] across the 4 lanes that share a row within one atom -----
   // Within a 4-lane sub-group sharing lane/4, the 4 lanes hold candidate K
