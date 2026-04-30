@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch==2.11.*", "nanobind>=2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-kmeans-cuda"
+version = "0.1.0"
+description = "Hand-rolled CUDA kernels for batched K-Means clustering (Euclidean hot path)"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "flash-kmeans-cuda authors" }]
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch==2.11.*",
+  "nanobind>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "flash-kmeans"]
+
+[tool.setuptools]
+packages = ["flash_kmeans_cuda"]
+include-package-data = false
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }

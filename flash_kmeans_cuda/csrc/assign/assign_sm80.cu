@@ -1,0 +1,618 @@
+// Ampere+ (sm_80) Euclidean assignment kernel using m16n8k16 mma.sync tensor
+// cores, with the min-over-K reduction fused inline so each mma's output is
+// consumed in registers and never materialized to SMEM (the structural diff
+// vs Triton's tl.dot, which has to materialize the cross-product before
+// reducing).
+//
+// Operand registers are populated via direct SCALAR SMEM loads — not
+// ldmatrix.x4. ldmatrix is faster (bank-conflict-free hardware path,
+// ~30%) but its lane-to-source mapping is delicate and error-prone, and
+// hand-debugged ldmatrix layouts are hard to verify without running on
+// hardware repeatedly. Scalar loads produce the bit-exact register layout
+// `mma.sync.m16n8k16.row.col.f32.f16.f16.f32` expects, by construction:
+//
+//   A reg layout (4 u32 / thread, 2 fp16 packed each):
+//     a0: A[m = lane/4,     k = 2*(lane%4) .. 2*(lane%4)+1]   (M-half 0, K-half 0)
+//     a1: A[m = lane/4 + 8, k = 2*(lane%4) .. 2*(lane%4)+1]   (M-half 1, K-half 0)
+//     a2: A[m = lane/4,     k = 2*(lane%4) + 8 .. + 9]        (M-half 0, K-half 1)
+//     a3: A[m = lane/4 + 8, k = 2*(lane%4) + 8 .. + 9]        (M-half 1, K-half 1)
+//
+//   B reg layout (2 u32 / thread, 2 fp16 packed each — packed along K):
+//     b0: B[k = 2*(lane%4) .. + 1, n = lane/4]                 (K-half 0, single N col)
+//     b1: B[k = 2*(lane%4) + 8 .. + 9, n = lane/4]             (K-half 1, single N col)
+//
+//   D reg layout (4 fp32 / thread):
+//     d0: D[m = lane/4,     n = 2*(lane%4)]
+//     d1: D[m = lane/4,     n = 2*(lane%4) + 1]
+//     d2: D[m = lane/4 + 8, n = 2*(lane%4)]
+//     d3: D[m = lane/4 + 8, n = 2*(lane%4) + 1]
+//
+// Tile layout per CTA:
+//   BLOCK_N = 128 points along N (4 warps × WARP_M=32 rows)
+//   BLOCK_K =  64 centroids per K-chunk (8 N atoms × 8 cols each)
+//   BLOCK_D =  16 features per mma K-step (2 K-halves × 8 cols)
+//
+// SMEM x_tile is loaded once (BLOCK_N × D) and reused across all K-chunks.
+// SMEM c_tile is double-buffered along K-chunks via cp.async.
+//
+// Notes:
+// - cluster_ids output is int32 to match the Triton signature.
+// - x_sq, c_sq are fp32 and broadcast in the in-register epilogue.
+// - D must be a multiple of 16 (covers the D=64/128/256 cases in the heuristic).
+// - Bank conflicts: scalar loads from a (BLOCK_N, D) row-major SMEM tile have
+//   conflicts when D is a power of 2. We accept this for now (correctness
+//   first); a future patch can pad the row stride.
+
+#include "assign.h"
+#include "assign_common.cuh"
+#include "../common/arch.cuh"
+#include "../common/ptx.cuh"
+
+#include "../common/torch_cuda_includes.h"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+namespace fkc {
+namespace assign {
+
+namespace {
+
+// Two tile configs:
+//   "wide" (default): BLOCK_N=128, BLOCK_K=64.  Good for many-points, few-K.
+//   "deep": BLOCK_N=64, BLOCK_K=128.            Good for many-K (K >= 512).
+// Selected at the launcher based on K. Both compile from the same kernel
+// template; tile sizes are template parameters.
+
+constexpr int BLOCK_D = 16;
+// SMEM row-stride padding (in fp16 elements). Adding 8 fp16 = 16 bytes
+// preserves cp.async's required 16-byte alignment of the destination
+// SMEM offset for every row, while shifting each subsequent SMEM row by
+// 4 banks. Without padding, power-of-2 D (64/128/256) causes 32-way bank
+// conflicts across rows; with this padding, the 8 cooperating row-bank
+// offsets land on distinct 4-byte banks.
+constexpr int SMEM_PAD = 8;
+
+template <typename T>
+__device__ __forceinline__ void mma_atom(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3);
+
+template <>
+__device__ __forceinline__ void mma_atom<__half>(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+  ptx::mma_m16n8k16_fp16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+}
+
+template <>
+__device__ __forceinline__ void mma_atom<__nv_bfloat16>(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+  ptx::mma_m16n8k16_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+}
+
+// Issue cp.async copies for one tile of rows_max × D fp16 elts. SMEM is
+// laid out with stride D_SMEM (= D + SMEM_PAD) to eliminate bank conflicts;
+// gmem source is contiguous at stride D.
+// Each thread copies 8 elts (16 bytes) per pass; loop over passes until full.
+template <typename T, int THREADS>
+__device__ __forceinline__ void async_load_tile(
+    T* smem_tile,                 // (rows_max * D_SMEM) destination
+    const T* gmem_tile,           // (rows * D) source
+    int rows,                     // valid row count (<= rows_max)
+    int rows_max,                 // SMEM row capacity
+    int D, int D_SMEM) {
+  const int tid = threadIdx.x;
+  const int total_elts = rows_max * D;
+  const int elts_per_load = 16 / sizeof(T);   // 8 for fp16/bf16
+  for (int off = tid * elts_per_load; off < total_elts;
+       off += THREADS * elts_per_load) {
+    int row = off / D;
+    int col = off % D;
+    bool valid = row < rows;
+    T* dst = smem_tile + (size_t)row * D_SMEM + col;
+    const T* src = gmem_tile + (size_t)row * D + col;
+    unsigned int dst_smem = ptx::cvta_to_shared(dst);
+    ptx::cp_async_16B(dst_smem, src, valid);
+  }
+}
+
+
+template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES>
+__global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
+assign_sm80_kernel(
+    const T* __restrict__ x,            // (B, N, D)
+    const T* __restrict__ centroids,    // (B, K, D)
+    const float* __restrict__ x_sq,     // (B, N)
+    const float* __restrict__ c_sq,     // (B, K)
+    int32_t* __restrict__ cluster_ids,  // (B, N)
+    int B, int N, int K, int D) {
+  constexpr int THREADS_PER_CTA = WARPS_PER_CTA * 32;
+  constexpr int WARP_M = BLOCK_N / WARPS_PER_CTA;
+  constexpr int M_ATOMS_PER_WARP = WARP_M / 16;
+  constexpr int N_ATOMS_PER_WARP = BLOCK_K / 8;
+  static_assert(WARP_M >= 16 && (WARP_M % 16) == 0, "WARP_M must be a multiple of 16");
+  static_assert((BLOCK_K % 8) == 0, "BLOCK_K must be a multiple of 8");
+
+  const int pid_n = blockIdx.x;
+  const int pid_b = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / kWarp;
+  const int lane = tid % kWarp;
+
+  const int n_start = pid_n * BLOCK_N;
+  const int n_count = min(BLOCK_N, N - n_start);
+  if (n_count <= 0) return;
+  const int D_SMEM = D + SMEM_PAD;
+
+  // SMEM layout (with row-stride padding D_SMEM = D + SMEM_PAD):
+  //   x_smem [BLOCK_N * D_SMEM]              (loaded once)
+  //   c_smem [PIPE_STAGES * BLOCK_K * D_SMEM]  (rotated)
+  //   c_sq_smem [PIPE_STAGES * BLOCK_K]
+  // (x_sq lives in registers — see xs_top_cache / xs_bot_cache below.)
+  extern __shared__ unsigned char smem_raw[];
+  T* x_smem = reinterpret_cast<T*>(smem_raw);
+  T* c_smem = x_smem + (size_t)BLOCK_N * D_SMEM;
+  float* c_sq_smem = reinterpret_cast<float*>(
+      c_smem + (size_t)PIPE_STAGES * BLOCK_K * D_SMEM);
+
+  // Per-thread running best across all K-chunks. Each warp owns WARP_M N
+  // rows split into M_ATOMS_PER_WARP atoms × 16 rows. Per atom, mma's D
+  // distribution puts each thread on 2 N rows (M-half 0 = lane/4 in 0..7,
+  // M-half 1 = lane/4 + 8 in 8..15). So per warp per thread we track
+  // M_ATOMS_PER_WARP * 2 best entries.
+  Best best[M_ATOMS_PER_WARP * 2];
+  #pragma unroll
+  for (int i = 0; i < M_ATOMS_PER_WARP * 2; ++i) {
+    best[i] = Best{FLT_MAX, 0};
+  }
+
+  // Load x_tile (CTA-wide). Issued once.
+  async_load_tile<T, THREADS_PER_CTA>(x_smem,
+                     x + (size_t)pid_b * N * D + (size_t)n_start * D,
+                     n_count, BLOCK_N, D, D_SMEM);
+  ptx::cp_async_commit();
+
+  const int num_k_chunks = (K + BLOCK_K - 1) / BLOCK_K;
+
+  auto issue_c_chunk = [&](int chunk_idx, int stage) {
+    int k_start = chunk_idx * BLOCK_K;
+    int k_count = min(BLOCK_K, K - k_start);
+    T* c_dst = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
+    float* csq_dst = c_sq_smem + stage * BLOCK_K;
+    async_load_tile<T, THREADS_PER_CTA>(c_dst,
+                       centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
+                       k_count, BLOCK_K, D, D_SMEM);
+    const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
+    for (int i = tid; i < BLOCK_K; i += THREADS_PER_CTA) {
+      csq_dst[i] = (i < k_count) ? csq_src[i] : 0.f;
+    }
+    ptx::cp_async_commit();
+  };
+
+  // Prime the pipeline: pre-issue up to PIPE_STAGES initial K-chunks.
+  #pragma unroll
+  for (int s = 0; s < PIPE_STAGES; ++s) {
+    if (s < num_k_chunks) issue_c_chunk(s, s);
+  }
+
+  // Wait for x_tile + first c chunk (i.e., everything but the last
+  // outstanding group).
+  ptx::cp_async_wait_group<PIPE_STAGES - 1>();
+  __syncthreads();
+
+  // Per-thread row/col indices used by both operand-load and epilogue.
+  // mma m16n8k16 D distribution: per atom the thread holds 4 fp32 regs at
+  // (M=lane/4, N=2*(lane%4)), (M=lane/4, N=2*(lane%4)+1),
+  // (M=lane/4+8, N=2*(lane%4)), (M=lane/4+8, N=2*(lane%4)+1).
+  const int row_top_in_warp = lane / 4;             // 0..7  (within 16-row atom)
+  const int row_bot_in_warp = row_top_in_warp + 8;  // 8..15
+  const int col_in_atom = (lane % 4) * 2;           // 0,2,4,6 within an 8-wide atom
+  const int k_in_atom_lo = col_in_atom;             // K-half 0 col index in atom
+  const int k_in_atom_hi = col_in_atom + 8;         // K-half 1 col index in atom
+
+  // ldmatrix lane-mapping constants (depend on lane only, not d_off / chunk).
+  const int ldm_row_off    = (lane & 8)  ? 8 : 0;   // bit 3 -> M-half (A) / N-half (B)
+  const int ldm_col_off    = (lane & 16) ? 8 : 0;   // bit 4 -> K-half
+  const int ldm_row_in_half = lane & 7;
+  const int ldm_n_atom_off = (lane & 8) ? 8 : 0;    // for B: bit 3 -> atom n vs n+1
+
+  // Cache per-thread x_sq values + row validity in registers. Each thread
+  // owns M_ATOMS_PER_WARP * 2 distinct rows. Loading once here avoids
+  // num_k_chunks SMEM reads per row in the epilogue.
+  float xs_top_cache[M_ATOMS_PER_WARP];
+  float xs_bot_cache[M_ATOMS_PER_WARP];
+  bool top_valid_cache[M_ATOMS_PER_WARP];
+  bool bot_valid_cache[M_ATOMS_PER_WARP];
+  #pragma unroll
+  for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+    int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+    int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+    top_valid_cache[m] = row_top < n_count;
+    bot_valid_cache[m] = row_bot < n_count;
+    // Read x_sq from gmem directly (it's small and read once); avoids the
+    // detour through SMEM for x_sq_smem.
+    xs_top_cache[m] = top_valid_cache[m]
+        ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
+    xs_bot_cache[m] = bot_valid_cache[m]
+        ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
+  }
+
+  for (int chunk_idx = 0; chunk_idx < num_k_chunks; ++chunk_idx) {
+    int k_start = chunk_idx * BLOCK_K;
+    int stage = chunk_idx % PIPE_STAGES;
+    T* c_tile = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
+    float* c_sq_tile = c_sq_smem + stage * BLOCK_K;
+
+    // Per-warp accumulator: [M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][4 fp32 regs/thread].
+    float acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][4];
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m)
+      #pragma unroll
+      for (int n = 0; n < N_ATOMS_PER_WARP; ++n)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+          acc[m][n][r] = 0.f;
+
+    // Walk D in BLOCK_D=16 steps; each step does one mma per (m, n) atom.
+    // Unroll up to 8 iters (covers D=64/128); for larger D the compiler
+    // partially unrolls. Unrolling lets nvcc software-pipeline the
+    // next-iter ldmatrix loads with the current-iter mma issues, hiding
+    // mma's ~16-cycle latency.
+    #pragma unroll 8
+    for (int d_off = 0; d_off < D; d_off += BLOCK_D) {
+      // ----- Load A regs via ldmatrix.x4 -----
+      // Source: x_smem (BLOCK_N, D_SMEM) row-major fp16. Per m-atom, load a
+      // 16x16 sub-tile starting at (m_base, d_off). The 4 8x8 sub-matrices
+      // map to mma A's 4 regs in order (M-half × K-half).
+      uint32_t a_regs[M_ATOMS_PER_WARP][4];
+      #pragma unroll
+      for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        int m_base = warp_id * WARP_M + m * 16;
+        int row = m_base + ldm_row_off + ldm_row_in_half;
+        unsigned int smem_addr = ptx::cvta_to_shared(
+            x_smem + (size_t)row * D_SMEM + d_off + ldm_col_off);
+        ptx::ldmatrix_x4(a_regs[m][0], a_regs[m][1],
+                         a_regs[m][2], a_regs[m][3], smem_addr);
+      }
+
+      // ----- Load B regs via ldmatrix.x4 (no trans), 2 atoms at a time -----
+      // Source: c_tile (BLOCK_K, D_SMEM) row-major. From mma's perspective B
+      // is (K=16, N=8) col-major, but our source memory has source-row = N
+      // (centroid) and source-col = K (feature). ldmatrix.x4 (no trans) post-
+      // load distribution: reg m of thread t = source[row=t/4, col=2*(t%4)..+1].
+      // With (row=N, col=K), this gives reg = (N=t/4, K=2*(t%4)..+1) — which
+      // is exactly mma B's b0 layout for one atom. The 4 sub-matrices in a
+      // single ldmatrix.x4 cover 2 N-atoms × 2 K-halves, mapping to:
+      //   matrix 0: N atom 0,  K-half 0  -> atom 0 b0
+      //   matrix 1: N atom 1,  K-half 0  -> atom 1 b0  (N-half = bit 3)
+      //   matrix 2: N atom 0,  K-half 1  -> atom 0 b1  (K-half = bit 4)
+      //   matrix 3: N atom 1,  K-half 1  -> atom 1 b1
+      uint32_t b_regs[N_ATOMS_PER_WARP][2];
+      static_assert((N_ATOMS_PER_WARP % 2) == 0,
+                    "ldmatrix.x4 covers 2 N-atoms; N_ATOMS must be even");
+      #pragma unroll
+      for (int n = 0; n < N_ATOMS_PER_WARP; n += 2) {
+        // Lane addressing: bit 3 selects N-half (atoms n vs n+1 in this batch),
+        // bit 4 selects K-half (d_off vs d_off+8). bits 0..2 select the row
+        // within the 8-row matrix (= lane%8 → centroid offset within atom).
+        int n_col = n * 8 + ldm_n_atom_off + ldm_row_in_half;
+        unsigned int smem_addr = ptx::cvta_to_shared(
+            c_tile + (size_t)n_col * D_SMEM + d_off + ldm_col_off);
+        uint32_t r0, r1, r2, r3;
+        ptx::ldmatrix_x4(r0, r1, r2, r3, smem_addr);
+        b_regs[n][0]     = r0;     // atom n,   K-half 0 (b0)
+        b_regs[n + 1][0] = r1;     // atom n+1, K-half 0 (b0)
+        b_regs[n][1]     = r2;     // atom n,   K-half 1 (b1)
+        b_regs[n + 1][1] = r3;     // atom n+1, K-half 1 (b1)
+      }
+
+      // ----- Issue mma atoms -----
+      #pragma unroll
+      for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+          mma_atom<T>(
+              acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
+              a_regs[m][0], a_regs[m][1], a_regs[m][2], a_regs[m][3],
+              b_regs[n][0], b_regs[n][1],
+              acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3]);
+        }
+      }
+    }  // d-loop
+
+    // ----- In-register epilogue: convert cross-product to distance and reduce -----
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+      const bool top_valid = top_valid_cache[m];
+      const bool bot_valid = bot_valid_cache[m];
+      const float xs_top = xs_top_cache[m];
+      const float xs_bot = xs_bot_cache[m];
+
+      #pragma unroll
+      for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+        // The two N-cols this thread holds for atom n.
+        int k_in_chunk_0 = n * 8 + col_in_atom;
+        int k_in_chunk_1 = k_in_chunk_0 + 1;
+        int k_global_0 = k_start + k_in_chunk_0;
+        int k_global_1 = k_start + k_in_chunk_1;
+        bool k0_valid = k_global_0 < K;
+        bool k1_valid = k_global_1 < K;
+        float cs0 = c_sq_tile[k_in_chunk_0];
+        float cs1 = c_sq_tile[k_in_chunk_1];
+
+        if (top_valid) {
+          if (k0_valid) {
+            float d = to_dist(acc[m][n][0], xs_top, cs0);
+            update_best(best[m * 2 + 0], d, k_global_0);
+          }
+          if (k1_valid) {
+            float d = to_dist(acc[m][n][1], xs_top, cs1);
+            update_best(best[m * 2 + 0], d, k_global_1);
+          }
+        }
+        if (bot_valid) {
+          if (k0_valid) {
+            float d = to_dist(acc[m][n][2], xs_bot, cs0);
+            update_best(best[m * 2 + 1], d, k_global_0);
+          }
+          if (k1_valid) {
+            float d = to_dist(acc[m][n][3], xs_bot, cs1);
+            update_best(best[m * 2 + 1], d, k_global_1);
+          }
+        }
+      }
+    }
+
+    // Prefetch chunk_idx + PIPE_STAGES (if any) before waiting.
+    int prefetch_idx = chunk_idx + PIPE_STAGES;
+    if (prefetch_idx < num_k_chunks) {
+      issue_c_chunk(prefetch_idx, prefetch_idx % PIPE_STAGES);
+    }
+    if (chunk_idx + 1 < num_k_chunks) {
+      ptx::cp_async_wait_group<PIPE_STAGES - 1>();
+      __syncthreads();
+    }
+  }  // k-chunk loop
+
+  // ----- Reduce best[] across the 4 lanes that share a row within one atom -----
+  // Within a 4-lane sub-group sharing lane/4, the 4 lanes hold candidate K
+  // cols 0,2,4,6 + their +1 (already folded into best[] above). __shfl_xor
+  // reduces by xoring the lane index within the 4-lane group.
+  auto warp_reduce_row = [&](Best& b) {
+    #pragma unroll
+    for (int offset : {1, 2}) {
+      float other_d = __shfl_xor_sync(0xffffffff, b.dist, offset, 4);
+      int   other_i = __shfl_xor_sync(0xffffffff, b.idx,  offset, 4);
+      // Match update_best's tie-break: lower distance wins; on tie keep
+      // the smaller idx (here, the one already held when other_d == b.dist).
+      if (other_d < b.dist || (other_d == b.dist && other_i < b.idx)) {
+        b.dist = other_d;
+        b.idx = other_i;
+      }
+    }
+  };
+
+  #pragma unroll
+  for (int i = 0; i < M_ATOMS_PER_WARP * 2; ++i) {
+    warp_reduce_row(best[i]);
+  }
+
+  // Lane (lane % 4 == 0) holds the row's answer; write cluster_ids.
+  if ((lane % 4) == 0) {
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+      int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+      int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+      if (row_top < n_count) {
+        cluster_ids[(size_t)pid_b * N + n_start + row_top] = best[m * 2 + 0].idx;
+      }
+      if (row_bot < n_count) {
+        cluster_ids[(size_t)pid_b * N + n_start + row_bot] = best[m * 2 + 1].idx;
+      }
+    }
+  }
+  // Outstanding cp.async groups (the final pre-fetched but unused chunks
+  // when num_k_chunks % PIPE_STAGES != 0) are drained implicitly at kernel
+  // exit; no explicit wait_all needed.
+}
+
+}  // namespace
+
+
+// Helper: compute SMEM bytes for a given tile (x_smem + PIPE_STAGES *
+// (c_smem + c_sq_smem); x_sq lives in registers).
+static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
+                                        int PIPE_STAGES_, size_t elt_sz) {
+  int D_SMEM = D + SMEM_PAD;
+  return (size_t)BLOCK_N_ * D_SMEM * elt_sz +
+         (size_t)PIPE_STAGES_ * BLOCK_K_ * D_SMEM * elt_sz +
+         (size_t)PIPE_STAGES_ * BLOCK_K_ * sizeof(float);
+}
+
+template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_>
+static void launch_typed(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    const at::Tensor& x_sq,
+    const at::Tensor& c_sq,
+    at::Tensor& cluster_ids,
+    int B, int N, int K, int D,
+    cudaStream_t stream) {
+  size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
+  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_>;
+  if (smem_bytes > 48 * 1024) {
+    cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem_bytes));
+  }
+  dim3 grid((N + BLOCK_N_ - 1) / BLOCK_N_, B);
+  dim3 block(WARPS_ * 32);
+  fn<<<grid, block, smem_bytes, stream>>>(
+      reinterpret_cast<const T*>(x.data_ptr()),
+      reinterpret_cast<const T*>(centroids.data_ptr()),
+      x_sq.data_ptr<float>(), c_sq.data_ptr<float>(),
+      cluster_ids.data_ptr<int32_t>(),
+      B, N, K, D);
+}
+
+
+void launch_assign_sm80(const at::Tensor& x,
+                        const at::Tensor& centroids,
+                        const at::Tensor& x_sq,
+                        const at::Tensor& c_sq,
+                        at::Tensor& cluster_ids) {
+  TORCH_CHECK(x.is_cuda() && centroids.is_cuda(), "x and centroids must be CUDA tensors");
+  TORCH_CHECK(x.dim() == 3 && centroids.dim() == 3, "x and centroids must be 3D (B,N,D)/(B,K,D)");
+  TORCH_CHECK(x.scalar_type() == centroids.scalar_type(),
+              "x and centroids must share dtype");
+  TORCH_CHECK(x_sq.scalar_type() == at::kFloat && c_sq.scalar_type() == at::kFloat,
+              "x_sq and c_sq must be fp32");
+  TORCH_CHECK(cluster_ids.scalar_type() == at::kInt,
+              "cluster_ids must be int32");
+
+  int B = x.size(0);
+  int N = x.size(1);
+  int D = x.size(2);
+  int K = centroids.size(1);
+  TORCH_CHECK(centroids.size(0) == B && centroids.size(2) == D,
+              "centroids must be (B, K, D) matching x");
+  TORCH_CHECK(D % BLOCK_D == 0, "assign_sm80: D must be a multiple of 16 (got ", D, ")");
+  TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
+              x_sq.is_contiguous() && c_sq.is_contiguous() &&
+              cluster_ids.is_contiguous(),
+              "all tensors must be contiguous");
+
+  c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Tile selection. "deep" tile (BLOCK_N=64, BLOCK_K=128) wins when K is
+  // large because it amortizes the centroid-tile load over fewer N tiles
+  // (2× the centroids per K-chunk → half as many K-chunks). The "wide" tile
+  // (BLOCK_N=128, BLOCK_K=64) wins on small K / large N because more points
+  // are processed per CTA, raising arithmetic intensity per c_tile load.
+  size_t elt_sz = x.element_size();
+
+  // Check the device's dynamic-smem-per-block limit. RTX 4090 (sm_89) caps
+  // at ~100 KB; H100 at ~228 KB. For very large D we may need the safe
+  // kernel.
+  int dev = x.device().index();
+  cudaDeviceProp props{};
+  cudaGetDeviceProperties(&props, dev);
+  size_t smem_limit = props.sharedMemPerBlockOptin;
+  if (smem_limit == 0) smem_limit = props.sharedMemPerBlock;
+
+  // Tile selection. Empirically on Ada (RTX 4090), the wide tile wins on
+  // every K we've measured because of its higher mma-to-load instruction
+  // ratio. We compile multiple variants and pick the best one that fits
+  // in the device's per-block SMEM budget. The "wide-3stage" variant uses
+  // 3 cp.async pipeline stages for deeper async overlap; "wide-2stage" is
+  // the fallback when 3 stages won't fit. The "deep" variant is compiled
+  // in for the rare case where wide doesn't fit and is forced via env.
+  static const bool force_deep_env = []() {
+    const char* s = std::getenv("FKC_ASSIGN_DEEP_TILE");
+    return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0);
+  }();
+
+  // SMEM budgets for each variant.
+  size_t smem_narrow_4stage = compute_smem_bytes(64, 64, D, 4, elt_sz);
+  size_t smem_wide_3stage = compute_smem_bytes(128, 64, D, 3, elt_sz);
+  size_t smem_wide_2stage = compute_smem_bytes(128, 64, D, 2, elt_sz);
+  size_t smem_deep_2stage = compute_smem_bytes(64, 128, D, 2, elt_sz);
+
+  // For SVG2-sized large-K work the SMEM budget forces 1 CTA/SM, which
+  // gives only 4 warps/SM = 1 warp/scheduler with WARPS=4. Doubling to
+  // WARPS=8 gives 2 warps/scheduler for proper latency hiding without
+  // reducing total work (each warp does half the M-atoms).
+  // BLOCK_N=64, BLOCK_K=64, 4 warps, 4 stages — deepest async pipeline that
+  // fits within Ada's 100 KB SMEM. Useful for very-large K where pipeline
+  // depth dominates over per-CTA arithmetic intensity.
+  auto try_launch_narrow_4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_narrow_4stage > smem_limit) return false;
+    launch_typed<T, 64, 64, 4, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                  B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_wide_3_w8 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_wide_3stage > smem_limit) return false;
+    launch_typed<T, 128, 64, 8, 3>(x, centroids, x_sq, c_sq, cluster_ids,
+                                   B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_wide_3_w4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_wide_3stage > smem_limit) return false;
+    launch_typed<T, 128, 64, 4, 3>(x, centroids, x_sq, c_sq, cluster_ids,
+                                   B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_wide_2_w4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_wide_2stage > smem_limit) return false;
+    launch_typed<T, 128, 64, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                   B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_deep_2_w4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_deep_2stage > smem_limit) return false;
+    launch_typed<T, 64, 128, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                   B, N, K, D, stream);
+    return true;
+  };
+
+  // Tile selection by K bucket. Empirically on Ada (RTX 4090):
+  //   K < 512  : wide-w4-3stage (more M-atoms per warp = higher arithmetic
+  //              intensity, fewer warps means each warp gets long mma runs).
+  //   K >= 512 : wide-w8-3stage (1 CTA/SM is forced by SMEM; doubling
+  //              warps gives 2 warps/scheduler for latency hiding).
+  // The narrow_4 (BLOCK_N=64 BLOCK_K=64, 4 stages) tile is kept as a
+  // last-resort fallback before deep when SMEM is tight on unusual shapes.
+  bool prefer_w8 = (K >= 512);
+
+  bool launched = false;
+  if (force_deep_env) {
+    if (x.scalar_type() == at::kHalf)             launched = try_launch_deep_2_w4(__half{});
+    else if (x.scalar_type() == at::kBFloat16)    launched = try_launch_deep_2_w4(__nv_bfloat16{});
+  } else {
+    auto run = [&](auto t) {
+      using T = decltype(t);
+      if (prefer_w8) {
+        return try_launch_wide_3_w8(t) ||
+               try_launch_wide_3_w4(t) ||
+               try_launch_wide_2_w4(t) ||
+               try_launch_narrow_4(t) ||
+               try_launch_deep_2_w4(t);
+      } else {
+        return try_launch_wide_3_w4(t) ||
+               try_launch_wide_2_w4(t) ||
+               try_launch_narrow_4(t) ||
+               try_launch_deep_2_w4(t);
+      }
+    };
+    if (x.scalar_type() == at::kHalf)            launched = run(__half{});
+    else if (x.scalar_type() == at::kBFloat16)   launched = run(__nv_bfloat16{});
+    else TORCH_CHECK(false, "assign_sm80 requires fp16 or bf16 input");
+  }
+
+  if (!launched) {
+    // No tile fits; fall back to the safe kernel.
+    launch_assign_safe(x, centroids, x_sq, c_sq, cluster_ids);
+    return;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+}  // namespace assign
+}  // namespace fkc
