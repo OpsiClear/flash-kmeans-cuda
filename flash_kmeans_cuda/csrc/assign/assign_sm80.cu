@@ -607,7 +607,7 @@ void launch_assign_sm80(const at::Tensor& x,
   //              warps gives 2 warps/scheduler for latency hiding).
   // The narrow_4 (BLOCK_N=64 BLOCK_K=64, 4 stages) tile is kept as a
   // last-resort fallback before deep when SMEM is tight on unusual shapes.
-  bool prefer_w8 = (K >= 256);
+  bool prefer_w8 = (K >= 128);
 
   bool launched = false;
   if (force_deep_env) {
