@@ -20,21 +20,28 @@ def _euclid_iter(
     centroids: torch.Tensor,
     *,
     compute_shift: bool = True,
+    cluster_ids_buf: Optional[torch.Tensor] = None,
+    sums_buf: Optional[torch.Tensor] = None,
+    counts_buf: Optional[torch.Tensor] = None,
+    new_centroids_buf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """One assign+update+finalize step. Returns (new_centroids, shift, cluster_ids).
 
     When ``compute_shift=False`` the shift is None — saves a fp32 cast +
-    norm + reduction per iter, which adds up at large K (the cast alone
-    materializes a (B, K, D) fp32 buffer twice the size of centroids).
+    norm + reduction per iter.
 
-    Both `centroids` and the returned `new_centroids` are in compute dtype.
+    The optional ``*_buf`` args let the caller reuse pre-allocated buffers
+    across iterations to avoid per-iter alloc churn through torch's caching
+    allocator.
     """
     B, K, D = centroids.shape
     c_sq = (centroids.float() ** 2).sum(dim=-1).contiguous()
-    cluster_ids = euclid_assign(x, centroids, x_sq, c_sq=c_sq)
+    cluster_ids = euclid_assign(x, centroids, x_sq, c_sq=c_sq, out=cluster_ids_buf)
 
-    sums, counts = centroid_update_sorted(x, cluster_ids, K)
-    new_centroids = centroid_finalize(sums, counts, centroids)
+    sums, counts = centroid_update_sorted(
+        x, cluster_ids, K, sums_out=sums_buf, counts_out=counts_buf)
+    new_centroids = centroid_finalize(
+        sums, counts, centroids, out=new_centroids_buf)
 
     shift = None
     if compute_shift:
@@ -91,22 +98,35 @@ def batch_kmeans_Euclid(
         centroids = init_centroids.contiguous()
     centroids = centroids.view(B, n_clusters, D)
 
-    cluster_ids = torch.empty(
-        (B, N), device=x.device, dtype=torch.int32
-    )
     # Skip shift compute when tol<=0 and not verbose: tol=0 means "always run
     # to max_iters" so the shift result is unused. Eliminates a (B,K,D) fp32
     # cast + norm + max + .item() sync per iter — significant at large K.
     need_shift = tol > 0 or verbose
+
+    # Pre-allocate buffers and ping-pong between two centroid buffers to
+    # avoid per-iter alloc churn through torch's caching allocator.
+    cluster_ids = torch.empty((B, N), device=x.device, dtype=torch.int32)
+    sums_buf = torch.zeros((B, n_clusters, D), device=x.device, dtype=torch.float32)
+    counts_buf = torch.zeros((B, n_clusters), device=x.device, dtype=torch.int32)
+    centroids_b = torch.empty_like(centroids)
+
     n_iters_run = 0
+    cur, nxt = centroids, centroids_b
     for it in range(max_iters):
         new_centroids, shift, cluster_ids = _euclid_iter(
-            x, x_sq, centroids, compute_shift=need_shift)
+            x, x_sq, cur,
+            compute_shift=need_shift,
+            cluster_ids_buf=cluster_ids,
+            sums_buf=sums_buf,
+            counts_buf=counts_buf,
+            new_centroids_buf=nxt,
+        )
         n_iters_run = it + 1
         if verbose:
             print(f"Iter {it}, center shift: {shift.item():.6f}")
         if need_shift and shift.item() < tol:
-            centroids = new_centroids
+            cur = new_centroids
             break
-        centroids = new_centroids
-    return cluster_ids, centroids, n_iters_run
+        cur, nxt = nxt, cur  # swap
+
+    return cluster_ids, cur, n_iters_run
