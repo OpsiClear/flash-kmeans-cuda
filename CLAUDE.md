@@ -123,10 +123,10 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 
 | Shape | our TFLOPS | Triton TFLOPS | ratio |
 |---|---|---|---|
-| med (N=32K, K=256) | 75 | 41 | **1.84×** |
-| big (N=131K, K=2048, SVG2) | 121 | 130 | 0.93× |
-| huge (N=262K, K=4096) | 133 | 138 | 0.96× |
-| mega (N=524K, K=8192) | 126 | 138 | 0.91× |
+| med (N=32K, K=256) | 76 | 40 | **1.92×** |
+| big (N=131K, K=2048, SVG2) | 114 | 124 | 0.92× |
+| huge (N=262K, K=4096) | 127 | 133 | 0.96× |
+| mega (N=524K, K=8192) | 131 | 133 | 0.98× |
 
 We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9% gap on large compute-bound shapes is fundamental — both kernels saturate the tensor cores. **10× Triton is unattainable** when both kernels approach hardware peak; the realistic ceiling is ~1.0–1.2×. We win on med because Triton's autotune isn't tuned for small shapes on Ada.
 
@@ -135,6 +135,7 @@ Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the py
 2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
 3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
 4. **Tile dispatch chain**: `widek128_2_w8 → widek96_2_w8 → wide_3_w8 → wide_3_w4 → wide_2_w4 → narrow_4 → deep_2_w4`. Picks the largest that fits the device's per-block SMEM.
+5. **Compile-time async `c_sq` copy for mega-scale K**: K>=8192 launches a distinct kernel variant that copies the tiny `c_sq` tile through `cp.async` with the centroid tile. A runtime branch hurt K=2048 codegen, so lower-K shapes keep the vectorized `float4` store path. L2 access-policy persistence for centroids was tested and regressed.
 - `csrc/update/update_sorted.cu` — sorted-chunk centroid accumulator. Caller (`flash_kmeans_cuda/ops.py`) does `torch.sort` on cluster_ids per batch, gathers x rows, then this kernel walks BLOCK_N=256 sorted tokens per CTA emitting one atomicAdd per run × BLOCK_D feature chunks. Output: fp32 sums + int32 counts.
 - `csrc/update/update_finalize.cu` — `new[b,k] = where(count > 0, sums / count, old)` cast to compute dtype. Trivial 1D grid.
 

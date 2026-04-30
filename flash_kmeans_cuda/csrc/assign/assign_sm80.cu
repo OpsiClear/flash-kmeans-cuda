@@ -143,9 +143,46 @@ __device__ __forceinline__ void async_load_tile(
   }
 }
 
+template <int THREADS>
+__device__ __forceinline__ void async_load_csq_tile(
+    float* smem_tile,
+    const float* gmem_tile,
+    int cols,
+    int cols_max) {
+  const int tid = threadIdx.x;
+  constexpr int floats_per_load = 4;  // 16 bytes
+  for (int off = tid * floats_per_load; off < cols_max;
+       off += THREADS * floats_per_load) {
+    int remaining = cols - off;
+    int valid_floats = remaining >= floats_per_load
+        ? floats_per_load
+        : (remaining > 0 ? remaining : 0);
+    const float* src = gmem_tile + (valid_floats > 0 ? off : 0);
+    unsigned int dst_smem = ptx::cvta_to_shared(smem_tile + off);
+    ptx::cp_async_16B(dst_smem, src, valid_floats * sizeof(float));
+  }
+}
+
+template <int THREADS>
+__device__ __forceinline__ void store_csq_tile(
+    float* smem_tile,
+    const float* gmem_tile,
+    int cols,
+    int cols_max) {
+  const int tid = threadIdx.x;
+  for (int i = tid * 4; i < cols_max; i += THREADS * 4) {
+    float4 v;
+    v.x = (i + 0 < cols) ? gmem_tile[i + 0] : 0.f;
+    v.y = (i + 1 < cols) ? gmem_tile[i + 1] : 0.f;
+    v.z = (i + 2 < cols) ? gmem_tile[i + 2] : 0.f;
+    v.w = (i + 3 < cols) ? gmem_tile[i + 3] : 0.f;
+    *reinterpret_cast<float4*>(&smem_tile[i]) = v;
+  }
+}
+
 
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
-          int N_TILES_PER_CTA = 1>
+          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -236,18 +273,12 @@ assign_sm80_kernel(
       async_load_tile<T, THREADS_PER_CTA>(c_dst,
                          centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
                          k_count, BLOCK_K, D, D_SMEM);
-      // Vectorize the c_sq scalar copy: each thread writes 4 floats (16B)
-      // per pass. Aligned ok because BLOCK_K is a multiple of 4 and the
-      // per-stage SMEM offset is also 16B-aligned.
+      static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
       const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
-      static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for vectorized csq copy");
-      for (int i = tid * 4; i < BLOCK_K; i += THREADS_PER_CTA * 4) {
-        float4 v;
-        v.x = (i + 0 < k_count) ? csq_src[i + 0] : 0.f;
-        v.y = (i + 1 < k_count) ? csq_src[i + 1] : 0.f;
-        v.z = (i + 2 < k_count) ? csq_src[i + 2] : 0.f;
-        v.w = (i + 3 < k_count) ? csq_src[i + 3] : 0.f;
-        *reinterpret_cast<float4*>(&csq_dst[i]) = v;
+      if constexpr (ASYNC_CSQ) {
+        async_load_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
+      } else {
+        store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
       }
       ptx::cp_async_commit();
     };
@@ -524,7 +555,7 @@ static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1>
+          int N_TILES_ = 1, bool ASYNC_CSQ_ = false>
 static void launch_typed(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -534,7 +565,8 @@ static void launch_typed(
     int B, int N, int K, int D,
     cudaStream_t stream) {
   size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
-  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_>;
+  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_,
+                               N_TILES_, ASYNC_CSQ_>;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
@@ -549,6 +581,26 @@ static void launch_typed(
       x_sq.data_ptr<float>(), c_sq.data_ptr<float>(),
       cluster_ids.data_ptr<int32_t>(),
       B, N, K, D);
+}
+
+template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
+          int N_TILES_ = 1>
+static void launch_typed_select_csq(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    const at::Tensor& x_sq,
+    const at::Tensor& c_sq,
+    at::Tensor& cluster_ids,
+    int B, int N, int K, int D,
+    cudaStream_t stream,
+    bool async_csq) {
+  if (async_csq) {
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
+  } else {
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
+  }
 }
 
 
@@ -617,6 +669,7 @@ void launch_assign_sm80(const at::Tensor& x,
   size_t smem_wide_3stage = compute_smem_bytes(128, 64, D, 3, elt_sz);
   size_t smem_wide_2stage = compute_smem_bytes(128, 64, D, 2, elt_sz);
   size_t smem_deep_2stage = compute_smem_bytes(64, 128, D, 2, elt_sz);
+  const bool async_csq = (K >= 8192);
 
   // For SVG2-sized large-K work the SMEM budget forces 1 CTA/SM, which
   // gives only 4 warps/SM = 1 warp/scheduler with WARPS=4. Doubling to
@@ -627,8 +680,8 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_widek128_2_w8 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek128_2stage > smem_limit) return false;
-    launch_typed<T, 128, 128, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                    B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 128, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                               B, N, K, D, stream, async_csq);
     return true;
   };
   // Persistent variants: each CTA processes N_TILES contiguous BLOCK_N rows.
@@ -639,8 +692,8 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_widek128_2_w8_n2 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek128_2stage > smem_limit) return false;
-    launch_typed<T, 128, 128, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                       B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 128, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                  B, N, K, D, stream, async_csq);
     return true;
   };
   // BLOCK_N=128, BLOCK_K=96, 8 warps, 2 stages — bigger K-chunk = longer
@@ -649,29 +702,29 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_widek96_2_w8 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek96_2stage > smem_limit) return false;
-    launch_typed<T, 128, 96, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                   B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 96, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                              B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_widek96_2_w8_n2 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek96_2stage > smem_limit) return false;
-    launch_typed<T, 128, 96, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                      B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 96, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                 B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_widek128_2_w8_n4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek128_2stage > smem_limit) return false;
-    launch_typed<T, 128, 128, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
-                                       B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 128, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                  B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_widek96_2_w8_n4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek96_2stage > smem_limit) return false;
-    launch_typed<T, 128, 96, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
-                                      B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 96, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                 B, N, K, D, stream, async_csq);
     return true;
   };
   // BLOCK_N=64, BLOCK_K=64, 4 warps, 4 stages — deepest async pipeline that
@@ -680,8 +733,8 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_narrow_4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_narrow_4stage > smem_limit) return false;
-    launch_typed<T, 64, 64, 4, 4>(x, centroids, x_sq, c_sq, cluster_ids,
-                                  B, N, K, D, stream);
+    launch_typed_select_csq<T, 64, 64, 4, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                             B, N, K, D, stream, async_csq);
     return true;
   };
   // BLOCK_N=64, BLOCK_K=32, 4 warps, 2 stages — small enough (~34 KB) for
@@ -692,50 +745,50 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_narrowk32_2_w4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_narrowk32_2stage > smem_limit) return false;
-    launch_typed<T, 64, 32, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                  B, N, K, D, stream);
+    launch_typed_select_csq<T, 64, 32, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                             B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_narrowk32_2_w4_n2 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_narrowk32_2stage > smem_limit) return false;
-    launch_typed<T, 64, 32, 4, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                     B, N, K, D, stream);
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_wide_3_w8 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
-    launch_typed<T, 128, 64, 8, 3>(x, centroids, x_sq, c_sq, cluster_ids,
-                                   B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 64, 8, 3>(x, centroids, x_sq, c_sq, cluster_ids,
+                                              B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_wide_3_w8_n2 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
-    launch_typed<T, 128, 64, 8, 3, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                      B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 64, 8, 3, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                 B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_wide_3_w4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
-    launch_typed<T, 128, 64, 4, 3>(x, centroids, x_sq, c_sq, cluster_ids,
-                                   B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 64, 4, 3>(x, centroids, x_sq, c_sq, cluster_ids,
+                                              B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_wide_2_w4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_2stage > smem_limit) return false;
-    launch_typed<T, 128, 64, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                   B, N, K, D, stream);
+    launch_typed_select_csq<T, 128, 64, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                              B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_deep_2_w4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_deep_2stage > smem_limit) return false;
-    launch_typed<T, 64, 128, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
-                                   B, N, K, D, stream);
+    launch_typed_select_csq<T, 64, 128, 4, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                              B, N, K, D, stream, async_csq);
     return true;
   };
 
