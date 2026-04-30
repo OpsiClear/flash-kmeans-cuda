@@ -649,6 +649,13 @@ void launch_assign_sm80(const at::Tensor& x,
                                    B, N, K, D, stream);
     return true;
   };
+  auto try_launch_wide_3_w8_n2 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_wide_3stage > smem_limit) return false;
+    launch_typed<T, 128, 64, 8, 3, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                      B, N, K, D, stream);
+    return true;
+  };
   auto try_launch_wide_3_w4 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
@@ -694,6 +701,14 @@ void launch_assign_sm80(const at::Tensor& x,
     return 2;
   }();
 
+  // 3-stage wide tile experiment knob. FKC_WIDE3=1 forces BN=128 BK=64 8w
+  // 3-stage instead of the BK=128/96 2-stage default. Smaller BK fits a
+  // deeper async pipeline; on long-K shapes this may overlap loads better.
+  static const bool force_wide3_env = []() {
+    const char* s = std::getenv("FKC_WIDE3");
+    return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0);
+  }();
+
   bool launched = false;
   if (force_deep_env) {
     if (x.scalar_type() == at::kHalf)             launched = try_launch_deep_2_w4(__half{});
@@ -702,6 +717,12 @@ void launch_assign_sm80(const at::Tensor& x,
     auto run = [&](auto t) {
       using T = decltype(t);
       if (prefer_w8) {
+        if (force_wide3_env) {
+          if (n_tiles_env >= 2) {
+            if (try_launch_wide_3_w8_n2(t)) return true;
+          }
+          if (try_launch_wide_3_w8(t))      return true;
+        }
         // Default (n_tiles_env=2) tries the N_TILES=2 wide variants first;
         // falls through to N_TILES=1 path on SMEM miss or when env forces 1.
         if (n_tiles_env == 2) {
