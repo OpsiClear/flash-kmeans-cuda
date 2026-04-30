@@ -552,6 +552,7 @@ void launch_assign_sm80(const at::Tensor& x,
   }();
 
   // SMEM budgets for each variant.
+  size_t smem_widek96_2stage = compute_smem_bytes(128, 96, D, 2, elt_sz);
   size_t smem_narrow_4stage = compute_smem_bytes(64, 64, D, 4, elt_sz);
   size_t smem_wide_3stage = compute_smem_bytes(128, 64, D, 3, elt_sz);
   size_t smem_wide_2stage = compute_smem_bytes(128, 64, D, 2, elt_sz);
@@ -561,6 +562,16 @@ void launch_assign_sm80(const at::Tensor& x,
   // gives only 4 warps/SM = 1 warp/scheduler with WARPS=4. Doubling to
   // WARPS=8 gives 2 warps/scheduler for proper latency hiding without
   // reducing total work (each warp does half the M-atoms).
+  // BLOCK_N=128, BLOCK_K=96, 8 warps, 2 stages — bigger K-chunk = longer
+  // per-warp mma queue (12 N-atoms), trades pipeline depth for arithmetic
+  // throughput.
+  auto try_launch_widek96_2_w8 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_widek96_2stage > smem_limit) return false;
+    launch_typed<T, 128, 96, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                   B, N, K, D, stream);
+    return true;
+  };
   // BLOCK_N=64, BLOCK_K=64, 4 warps, 4 stages — deepest async pipeline that
   // fits within Ada's 100 KB SMEM. Useful for very-large K where pipeline
   // depth dominates over per-CTA arithmetic intensity.
@@ -617,7 +628,8 @@ void launch_assign_sm80(const at::Tensor& x,
     auto run = [&](auto t) {
       using T = decltype(t);
       if (prefer_w8) {
-        return try_launch_wide_3_w8(t) ||
+        return try_launch_widek96_2_w8(t) ||
+               try_launch_wide_3_w8(t) ||
                try_launch_wide_3_w4(t) ||
                try_launch_wide_2_w4(t) ||
                try_launch_narrow_4(t) ||
