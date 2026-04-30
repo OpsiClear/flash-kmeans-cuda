@@ -144,7 +144,8 @@ __device__ __forceinline__ void async_load_tile(
 }
 
 
-template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES>
+template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
+          int N_TILES_PER_CTA = 1>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -159,21 +160,18 @@ assign_sm80_kernel(
   constexpr int N_ATOMS_PER_WARP = BLOCK_K / 8;
   static_assert(WARP_M >= 16 && (WARP_M % 16) == 0, "WARP_M must be a multiple of 16");
   static_assert((BLOCK_K % 8) == 0, "BLOCK_K must be a multiple of 8");
+  static_assert(N_TILES_PER_CTA >= 1, "N_TILES_PER_CTA must be >= 1");
 
-  const int pid_n = blockIdx.x;
+  // CTA-wide invariants (hoisted above the n_tile loop).
   const int pid_b = blockIdx.y;
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarp;
   const int lane = tid % kWarp;
-
-  const int n_start = pid_n * BLOCK_N;
-  const int n_count = min(BLOCK_N, N - n_start);
-  if (n_count <= 0) return;
   const int D_SMEM = D + SMEM_PAD;
 
   // SMEM layout (with row-stride padding D_SMEM = D + SMEM_PAD):
-  //   x_smem [BLOCK_N * D_SMEM]              (loaded once)
-  //   c_smem [PIPE_STAGES * BLOCK_K * D_SMEM]  (rotated)
+  //   x_smem [BLOCK_N * D_SMEM]              (re-loaded per n_tile)
+  //   c_smem [PIPE_STAGES * BLOCK_K * D_SMEM]  (rotated within a tile)
   //   c_sq_smem [PIPE_STAGES * BLOCK_K]
   // (x_sq lives in registers — see xs_top_cache / xs_bot_cache below.)
   extern __shared__ unsigned char smem_raw[];
@@ -181,51 +179,6 @@ assign_sm80_kernel(
   T* c_smem = x_smem + (size_t)BLOCK_N * D_SMEM;
   float* c_sq_smem = reinterpret_cast<float*>(
       c_smem + (size_t)PIPE_STAGES * BLOCK_K * D_SMEM);
-
-  // Per-thread running best across all K-chunks. Each warp owns WARP_M N
-  // rows split into M_ATOMS_PER_WARP atoms × 16 rows. Per atom, mma's D
-  // distribution puts each thread on 2 N rows (M-half 0 = lane/4 in 0..7,
-  // M-half 1 = lane/4 + 8 in 8..15). So per warp per thread we track
-  // M_ATOMS_PER_WARP * 2 best entries.
-  Best best[M_ATOMS_PER_WARP * 2];
-  #pragma unroll
-  for (int i = 0; i < M_ATOMS_PER_WARP * 2; ++i) {
-    best[i] = Best{FLT_MAX, 0};
-  }
-
-  // Load x_tile (CTA-wide). Issued once.
-  async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                     x + (size_t)pid_b * N * D + (size_t)n_start * D,
-                     n_count, BLOCK_N, D, D_SMEM);
-  ptx::cp_async_commit();
-
-  const int num_k_chunks = (K + BLOCK_K - 1) / BLOCK_K;
-
-  auto issue_c_chunk = [&](int chunk_idx, int stage) {
-    int k_start = chunk_idx * BLOCK_K;
-    int k_count = min(BLOCK_K, K - k_start);
-    T* c_dst = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
-    float* csq_dst = c_sq_smem + stage * BLOCK_K;
-    async_load_tile<T, THREADS_PER_CTA>(c_dst,
-                       centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
-                       k_count, BLOCK_K, D, D_SMEM);
-    const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
-    for (int i = tid; i < BLOCK_K; i += THREADS_PER_CTA) {
-      csq_dst[i] = (i < k_count) ? csq_src[i] : 0.f;
-    }
-    ptx::cp_async_commit();
-  };
-
-  // Prime the pipeline: pre-issue up to PIPE_STAGES initial K-chunks.
-  #pragma unroll
-  for (int s = 0; s < PIPE_STAGES; ++s) {
-    if (s < num_k_chunks) issue_c_chunk(s, s);
-  }
-
-  // Wait for x_tile + first c chunk (i.e., everything but the last
-  // outstanding group).
-  ptx::cp_async_wait_group<PIPE_STAGES - 1>();
-  __syncthreads();
 
   // Per-thread row/col indices used by both operand-load and epilogue.
   // mma m16n8k16 D distribution: per atom the thread holds 4 fp32 regs at
@@ -243,28 +196,81 @@ assign_sm80_kernel(
   const int ldm_row_in_half = lane & 7;
   const int ldm_n_atom_off = (lane & 8) ? 8 : 0;    // for B: bit 3 -> atom n vs n+1
 
-  // Cache per-thread x_sq values + row validity in registers. Each thread
-  // owns M_ATOMS_PER_WARP * 2 distinct rows. Loading once here avoids
-  // num_k_chunks SMEM reads per row in the epilogue.
-  float xs_top_cache[M_ATOMS_PER_WARP];
-  float xs_bot_cache[M_ATOMS_PER_WARP];
-  bool top_valid_cache[M_ATOMS_PER_WARP];
-  bool bot_valid_cache[M_ATOMS_PER_WARP];
-  #pragma unroll
-  for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
-    int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
-    int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
-    top_valid_cache[m] = row_top < n_count;
-    bot_valid_cache[m] = row_bot < n_count;
-    // Read x_sq from gmem directly (it's small and read once); avoids the
-    // detour through SMEM for x_sq_smem.
-    xs_top_cache[m] = top_valid_cache[m]
-        ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
-    xs_bot_cache[m] = bot_valid_cache[m]
-        ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
-  }
+  const int num_k_chunks = (K + BLOCK_K - 1) / BLOCK_K;
 
-  for (int chunk_idx = 0; chunk_idx < num_k_chunks; ++chunk_idx) {
+  // ====== Outer loop over N-tiles (persistent kernel) ======
+  // Each CTA processes N_TILES_PER_CTA contiguous BLOCK_N rows of N. Per
+  // n_tile we fully load + consume its x_smem + run the K-chunk loop +
+  // write cluster_ids. cp.async pipeline state is fully drained between
+  // tiles so the in-flight group counter stays predictable.
+  #pragma unroll 1
+  for (int n_tile = 0; n_tile < N_TILES_PER_CTA; ++n_tile) {
+    const int n_start = (blockIdx.x * N_TILES_PER_CTA + n_tile) * BLOCK_N;
+    const int n_count = min(BLOCK_N, N - n_start);
+    if (n_count <= 0) break;  // tail CTA: remaining tiles are out of range
+
+    // Per-tile state: best[], xs_*_cache, top/bot validity. RESET on every
+    // n_tile iteration — caching them across tiles would corrupt results.
+    Best best[M_ATOMS_PER_WARP * 2];
+    #pragma unroll
+    for (int i = 0; i < M_ATOMS_PER_WARP * 2; ++i) {
+      best[i] = Best{FLT_MAX, 0};
+    }
+
+    // Load x_tile (CTA-wide). Issued once per n_tile.
+    async_load_tile<T, THREADS_PER_CTA>(x_smem,
+                       x + (size_t)pid_b * N * D + (size_t)n_start * D,
+                       n_count, BLOCK_N, D, D_SMEM);
+    ptx::cp_async_commit();
+
+    auto issue_c_chunk = [&](int chunk_idx, int stage) {
+      int k_start = chunk_idx * BLOCK_K;
+      int k_count = min(BLOCK_K, K - k_start);
+      T* c_dst = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
+      float* csq_dst = c_sq_smem + stage * BLOCK_K;
+      async_load_tile<T, THREADS_PER_CTA>(c_dst,
+                         centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
+                         k_count, BLOCK_K, D, D_SMEM);
+      const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
+      for (int i = tid; i < BLOCK_K; i += THREADS_PER_CTA) {
+        csq_dst[i] = (i < k_count) ? csq_src[i] : 0.f;
+      }
+      ptx::cp_async_commit();
+    };
+
+    // Prime the pipeline: pre-issue up to PIPE_STAGES initial K-chunks.
+    #pragma unroll
+    for (int s = 0; s < PIPE_STAGES; ++s) {
+      if (s < num_k_chunks) issue_c_chunk(s, s);
+    }
+
+    // Wait for x_tile + first c chunk (i.e., everything but the last
+    // outstanding group).
+    ptx::cp_async_wait_group<PIPE_STAGES - 1>();
+    __syncthreads();
+
+    // Cache per-thread x_sq values + row validity in registers. Each thread
+    // owns M_ATOMS_PER_WARP * 2 distinct rows. Loading once here avoids
+    // num_k_chunks SMEM reads per row in the epilogue. Per-tile state.
+    float xs_top_cache[M_ATOMS_PER_WARP];
+    float xs_bot_cache[M_ATOMS_PER_WARP];
+    bool top_valid_cache[M_ATOMS_PER_WARP];
+    bool bot_valid_cache[M_ATOMS_PER_WARP];
+    #pragma unroll
+    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+      int row_top = warp_id * WARP_M + m * 16 + row_top_in_warp;
+      int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
+      top_valid_cache[m] = row_top < n_count;
+      bot_valid_cache[m] = row_bot < n_count;
+      // Read x_sq from gmem directly (it's small and read once); avoids the
+      // detour through SMEM for x_sq_smem.
+      xs_top_cache[m] = top_valid_cache[m]
+          ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
+      xs_bot_cache[m] = bot_valid_cache[m]
+          ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
+    }
+
+    for (int chunk_idx = 0; chunk_idx < num_k_chunks; ++chunk_idx) {
     int k_start = chunk_idx * BLOCK_K;
     int stage = chunk_idx % PIPE_STAGES;
     T* c_tile = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
@@ -450,9 +456,17 @@ assign_sm80_kernel(
       }
     }
   }
-  // Outstanding cp.async groups (the final pre-fetched but unused chunks
-  // when num_k_chunks % PIPE_STAGES != 0) are drained implicitly at kernel
-  // exit; no explicit wait_all needed.
+
+  // Drain ALL cp.async groups before next n_tile. The K-chunk loop's
+  // prefetch leaves up to PIPE_STAGES-1 trailing groups in flight; if we
+  // don't drain, the next tile's wait_group<PIPE_STAGES-1> would over-count
+  // them and start computing on stale c_smem. __syncthreads() ensures all
+  // warps reach the drain together (cp.async.wait_all is per-warp).
+  if (N_TILES_PER_CTA > 1) {
+    ptx::cp_async_wait_all();
+    __syncthreads();
+  }
+  }  // n_tile loop
 }
 
 }  // namespace
@@ -468,7 +482,8 @@ static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
          (size_t)PIPE_STAGES_ * BLOCK_K_ * sizeof(float);
 }
 
-template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_>
+template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
+          int N_TILES_ = 1>
 static void launch_typed(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -478,12 +493,14 @@ static void launch_typed(
     int B, int N, int K, int D,
     cudaStream_t stream) {
   size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
-  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_>;
+  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_>;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
   }
-  dim3 grid((N + BLOCK_N_ - 1) / BLOCK_N_, B);
+  // Persistent kernel: each CTA handles N_TILES_ contiguous BLOCK_N_ rows.
+  const int rows_per_cta = BLOCK_N_ * N_TILES_;
+  dim3 grid((N + rows_per_cta - 1) / rows_per_cta, B);
   dim3 block(WARPS_ * 32);
   fn<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<const T*>(x.data_ptr()),
@@ -572,6 +589,18 @@ void launch_assign_sm80(const at::Tensor& x,
                                     B, N, K, D, stream);
     return true;
   };
+  // Persistent variants: each CTA processes N_TILES contiguous BLOCK_N rows.
+  // Cuts launch count and lets the K-chunk pipeline + xs/c_sq caches amortize
+  // across multiple n-tiles, but the inter-tile cp.async drain costs cycles.
+  // Worth it when launch overhead and per-tile prologue/epilogue matter (high
+  // grid fan-out, low per-tile work).
+  auto try_launch_widek128_2_w8_n2 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_widek128_2stage > smem_limit) return false;
+    launch_typed<T, 128, 128, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                       B, N, K, D, stream);
+    return true;
+  };
   // BLOCK_N=128, BLOCK_K=96, 8 warps, 2 stages — bigger K-chunk = longer
   // per-warp mma queue (12 N-atoms), trades pipeline depth for arithmetic
   // throughput.
@@ -580,6 +609,27 @@ void launch_assign_sm80(const at::Tensor& x,
     if (smem_widek96_2stage > smem_limit) return false;
     launch_typed<T, 128, 96, 8, 2>(x, centroids, x_sq, c_sq, cluster_ids,
                                    B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_widek96_2_w8_n2 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_widek96_2stage > smem_limit) return false;
+    launch_typed<T, 128, 96, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
+                                      B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_widek128_2_w8_n4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_widek128_2stage > smem_limit) return false;
+    launch_typed<T, 128, 128, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                       B, N, K, D, stream);
+    return true;
+  };
+  auto try_launch_widek96_2_w8_n4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_widek96_2stage > smem_limit) return false;
+    launch_typed<T, 128, 96, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                      B, N, K, D, stream);
     return true;
   };
   // BLOCK_N=64, BLOCK_K=64, 4 warps, 4 stages — deepest async pipeline that
@@ -630,6 +680,20 @@ void launch_assign_sm80(const at::Tensor& x,
   // last-resort fallback before deep when SMEM is tight on unusual shapes.
   bool prefer_w8 = (K >= 128);
 
+  // Persistent N-tile knob. Default 2 — empirically wins or ties N_TILES=1
+  // across med/big/huge/mega shapes on Ada (RTX 4090). Halving the launch
+  // count amortizes per-tile prologue (x_tile load + xs/c_sq cache + epilogue)
+  // over 2 N-tiles per CTA; the inter-tile cp.async drain costs less than
+  // the saved setup. Override with FKC_NTILES={1,2,4} to re-A/B.
+  static const int n_tiles_env = []() {
+    const char* s = std::getenv("FKC_NTILES");
+    if (!s) return 2;
+    int v = std::atoi(s);
+    if (v == 1) return 1;
+    if (v == 4) return 4;
+    return 2;
+  }();
+
   bool launched = false;
   if (force_deep_env) {
     if (x.scalar_type() == at::kHalf)             launched = try_launch_deep_2_w4(__half{});
@@ -638,6 +702,15 @@ void launch_assign_sm80(const at::Tensor& x,
     auto run = [&](auto t) {
       using T = decltype(t);
       if (prefer_w8) {
+        // Default (n_tiles_env=2) tries the N_TILES=2 wide variants first;
+        // falls through to N_TILES=1 path on SMEM miss or when env forces 1.
+        if (n_tiles_env == 2) {
+          if (try_launch_widek128_2_w8_n2(t)) return true;
+          if (try_launch_widek96_2_w8_n2(t))  return true;
+        } else if (n_tiles_env == 4) {
+          if (try_launch_widek128_2_w8_n4(t)) return true;
+          if (try_launch_widek96_2_w8_n4(t))  return true;
+        }
         return try_launch_widek128_2_w8(t) ||
                try_launch_widek96_2_w8(t) ||
                try_launch_wide_3_w8(t) ||
