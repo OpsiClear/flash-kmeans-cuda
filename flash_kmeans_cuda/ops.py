@@ -83,12 +83,10 @@ def centroid_update_sorted(
 
     B, N, D = x.shape
 
-    # Sort by cluster_id along N. We need both the sorted ids and the gather
-    # indices to permute x. torch.sort returns (values, indices); the indices
-    # are int64.
+    # Sort by cluster_id along N. For very large K, avoiding a full x_sorted
+    # materialization wins; below that, contiguous x_sorted reads beat the
+    # indexed kernel's random row loads.
     sorted_ids, perm = torch.sort(cluster_ids, dim=1, stable=False)
-    perm_exp = perm.unsqueeze(-1).expand(-1, -1, D)
-    x_sorted = torch.gather(x, dim=1, index=perm_exp).contiguous()
     sorted_ids = sorted_ids.contiguous().to(torch.int32)
 
     if sums_out is None:
@@ -104,7 +102,13 @@ def centroid_update_sorted(
     else:
         counts_out.zero_()
 
-    _C.centroid_update_sorted(x_sorted, sorted_ids, sums_out, counts_out)
+    if x.dtype == torch.float16 and D == 128 and K >= 8192:
+        perm = perm.contiguous().to(torch.int32)
+        _C.centroid_update_sorted_indexed(x, perm, sorted_ids, sums_out, counts_out)
+    else:
+        perm_exp = perm.unsqueeze(-1).expand(-1, -1, D)
+        x_sorted = torch.gather(x, dim=1, index=perm_exp).contiguous()
+        _C.centroid_update_sorted(x_sorted, sorted_ids, sums_out, counts_out)
     return sums_out, counts_out
 
 

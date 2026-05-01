@@ -31,6 +31,22 @@ void launch_centroid_update_sorted(
     at::Tensor& centroid_sums,
     at::Tensor& centroid_counts);
 
+// Same sorted-run accumulator, but reads features from original-order x via
+// sorted_idx instead of requiring the caller to materialize x_sorted.
+//
+// Inputs:
+//   x                 : (B, N, D) compute dtype, contiguous, original order
+//   sorted_idx        : (B, N)    int32, indices returned by sorting cluster ids
+//   cluster_ids_sorted: (B, N)    int32, contiguous, monotonically non-decreasing
+//   centroid_sums     : (B, K, D) fp32, contiguous, *zero-initialized by caller*
+//   centroid_counts   : (B, K)    int32, contiguous, *zero-initialized by caller*
+void launch_centroid_update_sorted_indexed(
+    const at::Tensor& x,
+    const at::Tensor& sorted_idx,
+    const at::Tensor& cluster_ids_sorted,
+    at::Tensor& centroid_sums,
+    at::Tensor& centroid_counts);
+
 // Finalize: new_centroids = where(count > 0, sums / count, old_centroids)
 // then cast to old_centroids.dtype.
 //

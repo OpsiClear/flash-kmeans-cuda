@@ -167,8 +167,10 @@ def batch_kmeans_Euclid(
     # Pre-allocate buffers and ping-pong between two centroid buffers to
     # avoid per-iter alloc churn through torch's caching allocator.
     cluster_ids = torch.empty((B, N), device=x.device, dtype=torch.int32)
-    sums_buf = torch.zeros((B, n_clusters, D), device=x.device, dtype=torch.float32)
-    counts_buf = torch.zeros((B, n_clusters), device=x.device, dtype=torch.int32)
+    # centroid_update_sorted zeroes caller-provided buffers each iteration, so
+    # allocate uninitialized here and avoid a redundant setup memset.
+    sums_buf = torch.empty((B, n_clusters, D), device=x.device, dtype=torch.float32)
+    counts_buf = torch.empty((B, n_clusters), device=x.device, dtype=torch.int32)
     centroids_b = torch.empty_like(centroids)
 
     n_iters_run = 0

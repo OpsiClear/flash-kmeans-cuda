@@ -76,6 +76,16 @@ void centroid_update_sorted(
       x_sorted, cluster_ids_sorted, centroid_sums, centroid_counts);
 }
 
+void centroid_update_sorted_indexed(
+    at::Tensor x,
+    at::Tensor sorted_idx,
+    at::Tensor cluster_ids_sorted,
+    at::Tensor centroid_sums,
+    at::Tensor centroid_counts) {
+  fkc::update::launch_centroid_update_sorted_indexed(
+      x, sorted_idx, cluster_ids_sorted, centroid_sums, centroid_counts);
+}
+
 at::Tensor centroid_finalize(
     at::Tensor centroid_sums,
     at::Tensor centroid_counts,
@@ -102,6 +112,10 @@ NB_MODULE(_C, m) {
         nb::arg("x_sorted"), nb::arg("cluster_ids_sorted"),
         nb::arg("centroid_sums"), nb::arg("centroid_counts"),
         "Sorted-chunk centroid sum/count accumulator (in-place into sums/counts).");
+  m.def("centroid_update_sorted_indexed", &centroid_update_sorted_indexed,
+        nb::arg("x"), nb::arg("sorted_idx"), nb::arg("cluster_ids_sorted"),
+        nb::arg("centroid_sums"), nb::arg("centroid_counts"),
+        "Sorted-chunk centroid accumulator using original x plus sorted indices.");
   m.def("centroid_finalize", &centroid_finalize,
         nb::arg("centroid_sums"), nb::arg("centroid_counts"),
         nb::arg("old_centroids"),
