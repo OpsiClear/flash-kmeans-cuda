@@ -144,22 +144,16 @@ __device__ __forceinline__ void async_load_tile(
 }
 
 template <int THREADS>
-__device__ __forceinline__ void async_load_csq_tile(
+__device__ __forceinline__ void async_load_csq_full_tile(
     float* smem_tile,
     const float* gmem_tile,
-    int cols,
     int cols_max) {
   const int tid = threadIdx.x;
   constexpr int floats_per_load = 4;  // 16 bytes
   for (int off = tid * floats_per_load; off < cols_max;
        off += THREADS * floats_per_load) {
-    int remaining = cols - off;
-    int valid_floats = remaining >= floats_per_load
-        ? floats_per_load
-        : (remaining > 0 ? remaining : 0);
-    const float* src = gmem_tile + (valid_floats > 0 ? off : 0);
     unsigned int dst_smem = ptx::cvta_to_shared(smem_tile + off);
-    ptx::cp_async_16B(dst_smem, src, valid_floats * sizeof(float));
+    ptx::cp_async_16B(dst_smem, gmem_tile + off, true);
   }
 }
 
@@ -276,7 +270,11 @@ assign_sm80_kernel(
       static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
       const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
       if constexpr (ASYNC_CSQ) {
-        async_load_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
+        if (k_count == BLOCK_K) {
+          async_load_csq_full_tile<THREADS_PER_CTA>(csq_dst, csq_src, BLOCK_K);
+        } else {
+          store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
+        }
       } else {
         store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
       }
@@ -669,7 +667,7 @@ void launch_assign_sm80(const at::Tensor& x,
   size_t smem_wide_3stage = compute_smem_bytes(128, 64, D, 3, elt_sz);
   size_t smem_wide_2stage = compute_smem_bytes(128, 64, D, 2, elt_sz);
   size_t smem_deep_2stage = compute_smem_bytes(64, 128, D, 2, elt_sz);
-  const bool async_csq = (K >= 8192);
+  const bool async_csq = (K >= 256);
 
   // For SVG2-sized large-K work the SMEM budget forces 1 CTA/SM, which
   // gives only 4 warps/SM = 1 warp/scheduler with WARPS=4. Doubling to
