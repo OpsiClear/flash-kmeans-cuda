@@ -109,6 +109,7 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 - Pre-allocated buffers ping-pong'd across iterations (cluster_ids, sums, counts, centroid double-buffer) to avoid per-iter allocator churn. Sums/counts are allocated with `empty`; `centroid_update_sorted` zeroes caller-provided buffers each iteration, so `zeros` here was a redundant setup memset.
 - For fp16 D=128/K>=8192 on the default raw assign path, skip the initial `x_sq = (x.float() ** 2).sum(...)` setup and pass a dummy fp32 buffer, because the kernel's raw argmin score omits row-constant `x_sq`. Debug tile env vars and safe-mode force the exact `x_sq` compute.
 - Centroid update uses the original materialized `x_sorted` path below K=8192 because contiguous reads beat indexed random row loads on huge K=4096. For fp16 D=128/K>=8192, `centroid_update_sorted_indexed` consumes the sorted permutation directly and avoids materializing the full `(B,N,D)` `x_sorted` copy, which wins on mega.
+- The sorted-update path trusts `torch.sort` to preserve the already-int32 cluster-id dtype and only calls `.contiguous()` on `sorted_ids`; the old `.to(torch.int32)` was redundant in the hot wrapper.
 
 **Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
 
@@ -131,6 +132,15 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 | mega (N=524K, K=8192) | 131 | 133 | 0.98× |
 
 We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9% gap on large compute-bound shapes is fundamental — both kernels saturate the tensor cores. **10× Triton is unattainable** when both kernels approach hardware peak; the realistic ceiling is ~1.0–1.2×. We win on med because Triton's autotune isn't tuned for small shapes on Ada.
+
+**vs Triton (end-to-end `batch_kmeans_Euclid`, max_iters=1, fp16 D=128, exp55):**
+
+| Shape | our ms/iter | Triton ms/iter | speedup |
+|---|---:|---:|---:|
+| med (N=32K, K=256) | 0.215 | 0.828 | **3.85×** |
+| big (N=131K, K=2048) | 1.108 | 1.302 | **1.18×** |
+| huge (N=262K, K=4096) | 3.105 | 3.261 | **1.05×** |
+| mega (N=524K, K=8192) | 7.760 | 12.137 | **1.56×** |
 
 Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the pytorch-comparison auto-tune at 17.8× speedup; landed at 19.7× on big and 20.0× on huge. Wins:
 1. **fp16 accumulator** (`mma.f16.f16.f16`): 2× tensor-core throughput on Ada vs fp32 acc. Per-atom acc is 2 packed-fp16 regs/thread (vs 4 fp32). Acc is unpacked to fp32 in the epilogue's distance compute.

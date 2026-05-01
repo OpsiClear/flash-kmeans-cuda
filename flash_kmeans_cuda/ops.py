@@ -87,7 +87,7 @@ def centroid_update_sorted(
     # materialization wins; below that, contiguous x_sorted reads beat the
     # indexed kernel's random row loads.
     sorted_ids, perm = torch.sort(cluster_ids, dim=1, stable=False)
-    sorted_ids = sorted_ids.contiguous().to(torch.int32)
+    sorted_ids = sorted_ids.contiguous()
 
     if sums_out is None:
         sums_out = torch.zeros(
