@@ -311,10 +311,17 @@ assign_sm80_kernel(
       int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
       top_valid_cache[m] = row_top < n_count;
       bot_valid_cache[m] = row_bot < n_count;
-      xs_top_cache[m] = top_valid_cache[m]
-          ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
-      xs_bot_cache[m] = bot_valid_cache[m]
-          ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
+      if constexpr (RAW_DIST) {
+        // x_sq is constant across all candidate centroids for a row, so the
+        // raw-distance argmin can omit it and skip these global loads.
+        xs_top_cache[m] = 0.f;
+        xs_bot_cache[m] = 0.f;
+      } else {
+        xs_top_cache[m] = top_valid_cache[m]
+            ? x_sq[(size_t)pid_b * N + n_start + row_top] : 0.f;
+        xs_bot_cache[m] = bot_valid_cache[m]
+            ? x_sq[(size_t)pid_b * N + n_start + row_bot] : 0.f;
+      }
     }
 
     for (int chunk_idx = 0; chunk_idx < num_k_chunks; ++chunk_idx) {
@@ -430,10 +437,10 @@ assign_sm80_kernel(
             float a_bot1 = __high2float(packed_bot);
 
             if constexpr (RAW_DIST) {
-              update_best(best[m * 2 + 0], xs_top + cs0 - 2.0f * a_top0, k_global_0);
-              update_best(best[m * 2 + 0], xs_top + cs1 - 2.0f * a_top1, k_global_1);
-              update_best(best[m * 2 + 1], xs_bot + cs0 - 2.0f * a_bot0, k_global_0);
-              update_best(best[m * 2 + 1], xs_bot + cs1 - 2.0f * a_bot1, k_global_1);
+              update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+              update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+              update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+              update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
             } else {
               update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
               update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
@@ -467,12 +474,22 @@ assign_sm80_kernel(
             float a_bot1 = __high2float(packed_bot);
 
             if (top_valid) {
-              update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
-              update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+                update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+              } else {
+                update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+                update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+              }
             }
             if (bot_valid) {
-              update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
-              update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+                update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+              } else {
+                update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+                update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              }
             }
           }
         }
@@ -505,18 +522,34 @@ assign_sm80_kernel(
 
           if (top_valid) {
             if (k0_valid) {
-              update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+              } else {
+                update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+              }
             }
             if (k1_valid) {
-              update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+              } else {
+                update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+              }
             }
           }
           if (bot_valid) {
             if (k0_valid) {
-              update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+              } else {
+                update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+              }
             }
             if (k1_valid) {
-              update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+              } else {
+                update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              }
             }
           }
         }
