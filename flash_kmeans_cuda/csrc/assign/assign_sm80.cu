@@ -176,7 +176,7 @@ __device__ __forceinline__ void store_csq_tile(
 
 
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
-          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false>
+          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -198,7 +198,8 @@ assign_sm80_kernel(
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarp;
   const int lane = tid % kWarp;
-  const int D_SMEM = D + SMEM_PAD;
+  const int D_TILE = (D_FIXED > 0) ? D_FIXED : D;
+  const int D_SMEM = D_TILE + SMEM_PAD;
 
   // SMEM layout (with row-stride padding D_SMEM = D + SMEM_PAD):
   //   x_smem [BLOCK_N * D_SMEM]              (re-loaded per n_tile)
@@ -254,8 +255,8 @@ assign_sm80_kernel(
     // so we skip — saves the latency of an extra cp.async + sync pair.
     if (n_tile == 0) {
       async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                         x + (size_t)pid_b * N * D + (size_t)n_start * D,
-                         n_count, BLOCK_N, D, D_SMEM);
+                         x + (size_t)pid_b * N * D_TILE + (size_t)n_start * D_TILE,
+                         n_count, BLOCK_N, D_TILE, D_SMEM);
       ptx::cp_async_commit();
     }
 
@@ -265,8 +266,8 @@ assign_sm80_kernel(
       T* c_dst = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
       float* csq_dst = c_sq_smem + stage * BLOCK_K;
       async_load_tile<T, THREADS_PER_CTA>(c_dst,
-                         centroids + (size_t)pid_b * K * D + (size_t)k_start * D,
-                         k_count, BLOCK_K, D, D_SMEM);
+                         centroids + (size_t)pid_b * K * D_TILE + (size_t)k_start * D_TILE,
+                         k_count, BLOCK_K, D_TILE, D_SMEM);
       static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
       const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
       if constexpr (ASYNC_CSQ) {
@@ -340,7 +341,7 @@ assign_sm80_kernel(
     // next-iter ldmatrix loads with the current-iter mma issues, hiding
     // mma's ~16-cycle latency.
     #pragma unroll 8
-    for (int d_off = 0; d_off < D; d_off += BLOCK_D) {
+    for (int d_off = 0; d_off < D_TILE; d_off += BLOCK_D) {
       // ----- Load A regs via ldmatrix.x4 -----
       // Source: x_smem (BLOCK_N, D_SMEM) row-major fp16. Per m-atom, load a
       // 16x16 sub-tile starting at (m_base, d_off). The 4 8x8 sub-matrices
@@ -541,8 +542,8 @@ assign_sm80_kernel(
     if (n_count_next > 0) {
       __syncthreads();
       async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                         x + (size_t)pid_b * N * D + (size_t)n_start_next * D,
-                         n_count_next, BLOCK_N, D, D_SMEM);
+                         x + (size_t)pid_b * N * D_TILE + (size_t)n_start_next * D_TILE,
+                         n_count_next, BLOCK_N, D_TILE, D_SMEM);
       ptx::cp_async_commit();
     }
   }
@@ -614,7 +615,7 @@ static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, bool ASYNC_CSQ_ = false>
+          int N_TILES_ = 1, bool ASYNC_CSQ_ = false, int D_FIXED_ = 0>
 static void launch_typed(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -625,7 +626,7 @@ static void launch_typed(
     cudaStream_t stream) {
   size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
   auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_,
-                               N_TILES_, ASYNC_CSQ_>;
+                               N_TILES_, ASYNC_CSQ_, D_FIXED_>;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
@@ -643,7 +644,7 @@ static void launch_typed(
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1>
+          int N_TILES_ = 1, int D_FIXED_ = 0>
 static void launch_typed_select_csq(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -654,10 +655,10 @@ static void launch_typed_select_csq(
     cudaStream_t stream,
     bool async_csq) {
   if (async_csq) {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true>(
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   } else {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false>(
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   }
 }
@@ -770,6 +771,13 @@ void launch_assign_sm80(const at::Tensor& x,
     if (smem_widek96_2stage > smem_limit) return false;
     launch_typed_select_csq<T, 128, 96, 8, 2, 2>(x, centroids, x_sq, c_sq, cluster_ids,
                                                  B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_widek96_2_w8_n2_d128 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 128 || K < 2048 || smem_widek96_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                      B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_widek128_2_w8_n4 = [&](auto t) -> bool {
@@ -932,6 +940,7 @@ void launch_assign_sm80(const at::Tensor& x,
         // sweet spot. Reverted; left history in commit.
         if (n_tiles_env == 2) {
           if (try_launch_widek128_2_w8_n2(t)) return true;
+          if (try_launch_widek96_2_w8_n2_d128(t)) return true;
           if (try_launch_widek96_2_w8_n2(t))  return true;
         } else if (n_tiles_env == 4) {
           if (try_launch_widek128_2_w8_n4(t)) return true;
