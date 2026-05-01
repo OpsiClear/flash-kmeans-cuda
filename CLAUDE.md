@@ -107,6 +107,7 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 **Iter-loop overhead optimizations** (`flash_kmeans_cuda/kmeans.py`):
 - `compute_shift=False` when `tol<=0` — eliminates a (B,K,D) fp32 cast + norm + max + `.item()` sync per iter. With K=2048 the savings are 17% of full-iter time on big shapes.
 - Pre-allocated buffers ping-pong'd across iterations (cluster_ids, sums, counts, centroid double-buffer) to avoid per-iter allocator churn.
+- For fp16 D=128/K>=8192 on the default raw assign path, skip the initial `x_sq = (x.float() ** 2).sum(...)` setup and pass a dummy fp32 buffer, because the kernel's raw argmin score omits row-constant `x_sq`. Debug tile env vars and safe-mode force the exact `x_sq` compute.
 
 **Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
 

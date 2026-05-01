@@ -29,3 +29,24 @@ def test_shape(B, N, K, D):
     assert cents.dtype == torch.float16
     # Each cluster_id must be in [0, K).
     assert (ids >= 0).all() and (ids < K).all()
+
+
+def test_large_k_raw_kmeans_assignment_matches_reference():
+    """K>=8192 D=128 uses the raw assign path where x_sq is intentionally unused."""
+    torch.manual_seed(123)
+    B, N, K, D = 1, 256, 8192, 128
+    x = torch.randn(B, N, D, device="cuda", dtype=torch.float16)
+    init = torch.randn(B, K, D, device="cuda", dtype=torch.float16)
+
+    ids, cents, n_iters = batch_kmeans_Euclid(
+        x, K, max_iters=1, tol=0.0, init_centroids=init)
+
+    x_sq = (x.float() ** 2).sum(dim=-1).contiguous()
+    c_sq = (init.float() ** 2).sum(dim=-1).contiguous()
+    cross = torch.einsum("bnd,bkd->bnk", x.float(), init.float())
+    ref = (x_sq.unsqueeze(-1) + c_sq.unsqueeze(1) - 2.0 * cross).argmin(dim=-1)
+    disagreement = (ids.long() != ref.long()).float().mean().item()
+
+    assert n_iters == 1
+    assert cents.shape == (B, K, D)
+    assert disagreement < 0.05

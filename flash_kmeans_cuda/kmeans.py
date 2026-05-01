@@ -8,10 +8,66 @@ shift to check convergence.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 import torch
 
 from .ops import euclid_assign, centroid_update_sorted, centroid_finalize
+
+
+def _env_true(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.lower() in ("1", "true")
+
+
+def _ntiles_allows_d128_raw_path() -> bool:
+    value = os.environ.get("FKC_NTILES")
+    if value is None:
+        return True
+    try:
+        parsed = int(value)
+    except ValueError:
+        return False
+    return parsed not in (1, 4)
+
+
+def _smem_limit(device: torch.device) -> int:
+    props = torch.cuda.get_device_properties(device)
+    for attr in (
+        "shared_memory_per_block_optin",
+        "max_shared_memory_per_block_optin",
+        "shared_memory_per_block",
+        "max_shared_memory_per_block",
+    ):
+        value = getattr(props, attr, None)
+        if value:
+            return int(value)
+    return 48 * 1024
+
+
+def _can_skip_x_sq_for_assign(x: torch.Tensor, n_clusters: int) -> bool:
+    """True when assign_sm80's D=128 mega raw path cannot read x_sq."""
+    if x.dtype != torch.float16:
+        return False
+    if x.shape[-1] != 128 or n_clusters < 8192:
+        return False
+    if not _ntiles_allows_d128_raw_path():
+        return False
+    for name in (
+        "FKC_ASSIGN_FORCE_SAFE",
+        "FKC_ASSIGN_DEEP_TILE",
+        "FKC_NARROW",
+        "FKC_WIDE3",
+        "FKC_W4",
+    ):
+        if _env_true(name):
+            return False
+
+    d_smem = 128 + 8  # D + SMEM_PAD in assign_sm80.cu.
+    required = 128 * d_smem * x.element_size()
+    required += 2 * 96 * d_smem * x.element_size()
+    required += 2 * 96 * 4
+    return _smem_limit(x.device) >= required
 
 
 def _euclid_iter(
@@ -87,7 +143,12 @@ def batch_kmeans_Euclid(
 
     B, N, D = x.shape
 
-    x_sq = (x.float() ** 2).sum(dim=-1).contiguous()  # (B, N) fp32
+    if _can_skip_x_sq_for_assign(x, n_clusters):
+        # The D=128/K>=8192 raw assign path scores c_sq - 2*x@c. x_sq is
+        # row-constant for argmin, so a correctly routed kernel never reads it.
+        x_sq = torch.empty((B, N), device=x.device, dtype=torch.float32)
+    else:
+        x_sq = (x.float() ** 2).sum(dim=-1).contiguous()  # (B, N) fp32
 
     if init_centroids is None:
         idx = torch.randint(0, N, (B, n_clusters), device=x.device)
