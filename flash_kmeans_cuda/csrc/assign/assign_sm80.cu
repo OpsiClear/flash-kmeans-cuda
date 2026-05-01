@@ -176,7 +176,8 @@ __device__ __forceinline__ void store_csq_tile(
 
 
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
-          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0>
+          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0,
+          bool RAW_DIST = false>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -428,10 +429,17 @@ assign_sm80_kernel(
             float a_bot0 = __low2float(packed_bot);
             float a_bot1 = __high2float(packed_bot);
 
-            update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
-            update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
-            update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
-            update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+            if constexpr (RAW_DIST) {
+              update_best(best[m * 2 + 0], xs_top + cs0 - 2.0f * a_top0, k_global_0);
+              update_best(best[m * 2 + 0], xs_top + cs1 - 2.0f * a_top1, k_global_1);
+              update_best(best[m * 2 + 1], xs_bot + cs0 - 2.0f * a_bot0, k_global_0);
+              update_best(best[m * 2 + 1], xs_bot + cs1 - 2.0f * a_bot1, k_global_1);
+            } else {
+              update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+              update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+              update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+              update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+            }
           }
         }
       } else {
@@ -615,7 +623,8 @@ static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, bool ASYNC_CSQ_ = false, int D_FIXED_ = 0>
+          int N_TILES_ = 1, bool ASYNC_CSQ_ = false, int D_FIXED_ = 0,
+          bool RAW_DIST_ = false>
 static void launch_typed(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -626,7 +635,7 @@ static void launch_typed(
     cudaStream_t stream) {
   size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
   auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_,
-                               N_TILES_, ASYNC_CSQ_, D_FIXED_>;
+                               N_TILES_, ASYNC_CSQ_, D_FIXED_, RAW_DIST_>;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
@@ -644,7 +653,7 @@ static void launch_typed(
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, int D_FIXED_ = 0>
+          int N_TILES_ = 1, int D_FIXED_ = 0, bool RAW_DIST_ = false>
 static void launch_typed_select_csq(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -655,10 +664,10 @@ static void launch_typed_select_csq(
     cudaStream_t stream,
     bool async_csq) {
   if (async_csq) {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_>(
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_, RAW_DIST_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   } else {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_>(
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_, RAW_DIST_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   }
 }
@@ -776,8 +785,15 @@ void launch_assign_sm80(const at::Tensor& x,
   auto try_launch_widek96_2_w8_n2_d128 = [&](auto t) -> bool {
     using T = decltype(t);
     if (D != 128 || K < 2048 || smem_widek96_2stage > smem_limit) return false;
-    launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128>(x, centroids, x_sq, c_sq, cluster_ids,
-                                                      B, N, K, D, stream, async_csq);
+    // Raw distance trims the hot epilogue on mega K. K=2048/4096 benchmarked
+    // slower with it, so keep those shapes on the clamped path.
+    if (K >= 8192) {
+      launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, true>(
+          x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    } else {
+      launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, false>(
+          x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    }
     return true;
   };
   auto try_launch_widek128_2_w8_n4 = [&](auto t) -> bool {
