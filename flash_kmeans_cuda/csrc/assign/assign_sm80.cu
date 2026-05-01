@@ -317,6 +317,7 @@ assign_sm80_kernel(
 
     for (int chunk_idx = 0; chunk_idx < num_k_chunks; ++chunk_idx) {
     int k_start = chunk_idx * BLOCK_K;
+    int k_count = min(BLOCK_K, K - k_start);
     int stage = chunk_idx % PIPE_STAGES;
     T* c_tile = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
     float* c_sq_tile = c_sq_smem + stage * BLOCK_K;
@@ -401,53 +402,83 @@ assign_sm80_kernel(
     }  // d-loop
 
     // ----- In-register epilogue: convert cross-product to distance and reduce -----
-    #pragma unroll
-    for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
-      const bool top_valid = top_valid_cache[m];
-      const bool bot_valid = bot_valid_cache[m];
-      const float xs_top = xs_top_cache[m];
-      const float xs_bot = xs_bot_cache[m];
-
+    if (k_count == BLOCK_K) {
+      // Hot path: all K columns in this chunk are valid. Avoid per-candidate
+      // K-bound checks; only the final partial chunk needs them.
       #pragma unroll
-      for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
-        // The two N-cols this thread holds for atom n.
-        int k_in_chunk_0 = n * 8 + col_in_atom;
-        int k_in_chunk_1 = k_in_chunk_0 + 1;
-        int k_global_0 = k_start + k_in_chunk_0;
-        int k_global_1 = k_start + k_in_chunk_1;
-        bool k0_valid = k_global_0 < K;
-        bool k1_valid = k_global_1 < K;
-        float cs0 = c_sq_tile[k_in_chunk_0];
-        float cs1 = c_sq_tile[k_in_chunk_1];
+      for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        const bool top_valid = top_valid_cache[m];
+        const bool bot_valid = bot_valid_cache[m];
+        const float xs_top = xs_top_cache[m];
+        const float xs_bot = xs_bot_cache[m];
 
-        // Unpack fp16-packed acc into 4 fp32 cross-product values.
-        // acc[m][n][0] = (top row col0 fp16, top row col1 fp16)
-        // acc[m][n][1] = (bot row col0 fp16, bot row col1 fp16)
-        __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
-        __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
-        float a_top0 = __low2float(packed_top);
-        float a_top1 = __high2float(packed_top);
-        float a_bot0 = __low2float(packed_bot);
-        float a_bot1 = __high2float(packed_bot);
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+          int k_in_chunk_0 = n * 8 + col_in_atom;
+          int k_in_chunk_1 = k_in_chunk_0 + 1;
+          int k_global_0 = k_start + k_in_chunk_0;
+          int k_global_1 = k_start + k_in_chunk_1;
+          float cs0 = c_sq_tile[k_in_chunk_0];
+          float cs1 = c_sq_tile[k_in_chunk_1];
 
-        if (top_valid) {
-          if (k0_valid) {
-            float d = to_dist(a_top0, xs_top, cs0);
-            update_best(best[m * 2 + 0], d, k_global_0);
+          __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
+          __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
+          float a_top0 = __low2float(packed_top);
+          float a_top1 = __high2float(packed_top);
+          float a_bot0 = __low2float(packed_bot);
+          float a_bot1 = __high2float(packed_bot);
+
+          if (top_valid) {
+            update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+            update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
           }
-          if (k1_valid) {
-            float d = to_dist(a_top1, xs_top, cs1);
-            update_best(best[m * 2 + 0], d, k_global_1);
+          if (bot_valid) {
+            update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+            update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
           }
         }
-        if (bot_valid) {
-          if (k0_valid) {
-            float d = to_dist(a_bot0, xs_bot, cs0);
-            update_best(best[m * 2 + 1], d, k_global_0);
+      }
+    } else {
+      #pragma unroll
+      for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
+        const bool top_valid = top_valid_cache[m];
+        const bool bot_valid = bot_valid_cache[m];
+        const float xs_top = xs_top_cache[m];
+        const float xs_bot = xs_bot_cache[m];
+
+        #pragma unroll
+        for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
+          int k_in_chunk_0 = n * 8 + col_in_atom;
+          int k_in_chunk_1 = k_in_chunk_0 + 1;
+          int k_global_0 = k_start + k_in_chunk_0;
+          int k_global_1 = k_start + k_in_chunk_1;
+          bool k0_valid = k_global_0 < K;
+          bool k1_valid = k_global_1 < K;
+          float cs0 = c_sq_tile[k_in_chunk_0];
+          float cs1 = c_sq_tile[k_in_chunk_1];
+
+          __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
+          __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
+          float a_top0 = __low2float(packed_top);
+          float a_top1 = __high2float(packed_top);
+          float a_bot0 = __low2float(packed_bot);
+          float a_bot1 = __high2float(packed_bot);
+
+          if (top_valid) {
+            if (k0_valid) {
+              update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+            }
+            if (k1_valid) {
+              update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+            }
           }
-          if (k1_valid) {
-            float d = to_dist(a_bot1, xs_bot, cs1);
-            update_best(best[m * 2 + 1], d, k_global_1);
+          if (bot_valid) {
+            if (k0_valid) {
+              update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+            }
+            if (k1_valid) {
+              update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+            }
           }
         }
       }
