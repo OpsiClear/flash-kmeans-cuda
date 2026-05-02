@@ -107,7 +107,7 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 **Iter-loop overhead optimizations** (`flash_kmeans_cuda/kmeans.py`):
 - `compute_shift=False` when `tol<=0` — eliminates a (B,K,D) fp32 cast + norm + max + `.item()` sync per iter. With K=2048 the savings are 17% of full-iter time on big shapes.
 - Pre-allocated buffers ping-pong'd across iterations (cluster_ids, sums, counts, centroid double-buffer) to avoid per-iter allocator churn. Sums/counts are allocated with `empty`; `centroid_update_sorted` zeroes caller-provided buffers each iteration, so `zeros` here was a redundant setup memset.
-- For fp16 D=128/K>=2048 on the default raw assign path, skip the initial `x_sq = (x.float() ** 2).sum(...)` setup and pass a dummy fp32 buffer, because the kernel's raw argmin score omits row-constant `x_sq`. Debug tile env vars and safe-mode force the exact `x_sq` compute.
+- For fp16 D=128/K>=256 on the default raw assign path, skip the initial `x_sq = (x.float() ** 2).sum(...)` setup and pass a dummy fp32 buffer, because the kernel's raw argmin score omits row-constant `x_sq`. Debug tile env vars and safe-mode force the exact `x_sq` compute.
 - Centroid update uses the original materialized `x_sorted` path below K=256 because contiguous reads beat indexed random row loads there. For fp16 D=128/K>=256, `centroid_update_sorted_indexed` consumes the sorted permutation directly and avoids materializing the full `(B,N,D)` `x_sorted` copy, which wins on med/big/huge/mega after shared-index caching.
 - The sorted-update path trusts `torch.sort` to preserve the already-int32 cluster-id dtype and only calls `.contiguous()` on `sorted_ids`; the old `.to(torch.int32)` was redundant in the hot wrapper.
 - The indexed mega update caches each CTA's 256 sorted row indices in shared memory before the feature loop. That avoids rereading the same global `sorted_idx` value from all 128 feature threads in the run accumulator.
@@ -127,18 +127,18 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 
 | Shape | our TFLOPS | Triton TFLOPS | ratio |
 |---|---|---|---|
-| med (N=32K, K=256) | 76 | 40 | **1.92×** |
+| med (N=32K, K=256) | 93 | 39 | **2.36×** |
 | big (N=131K, K=2048, SVG2) | 114 | 124 | 0.92× |
 | huge (N=262K, K=4096) | 127 | 133 | 0.96× |
 | mega (N=524K, K=8192) | 131 | 133 | 0.98× |
 
 We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9% gap on large compute-bound shapes is fundamental — both kernels saturate the tensor cores. **10× Triton is unattainable** when both kernels approach hardware peak; the realistic ceiling is ~1.0–1.2×. We win on med because Triton's autotune isn't tuned for small shapes on Ada.
 
-**vs Triton (end-to-end `batch_kmeans_Euclid`, max_iters=1, fp16 D=128, exp62):**
+**vs Triton (end-to-end `batch_kmeans_Euclid`, max_iters=1, fp16 D=128, exp67):**
 
 | Shape | our ms/iter | Triton ms/iter | speedup |
 |---|---:|---:|---:|
-| med (N=32K, K=256) | 0.188 | 0.634 | **3.37×** |
+| med (N=32K, K=256) | 0.176 | 0.580 | **3.30×** |
 | big (N=131K, K=2048) | 0.603 | 1.130 | **1.87×** |
 | huge (N=262K, K=4096) | 1.683 | 3.183 | **1.89×** |
 | mega (N=524K, K=8192) | 6.423 | 12.540 | **1.95×** |
@@ -148,7 +148,7 @@ Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the py
 2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
 3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
 4. **Tile dispatch chain**: `widek128_2_w8 → widek96_2_w8 → wide_3_w8 → wide_3_w4 → wide_2_w4 → narrow_4 → deep_2_w4`. Picks the largest that fits the device's per-block SMEM.
-5. **Compile-time async `c_sq` copy for K>=256**: large enough K launches a distinct kernel variant that copies full `c_sq` tiles through `cp.async` with the centroid tile; the final partial K chunk uses the vectorized store path to avoid out-of-bounds 16B async copies. Full K chunks skip per-candidate K-bound checks in the epilogue, and full N tiles skip row-validity checks. For D=128 and K>=2048, the hot BK=96/N_TILES=2 tile uses a D-specialized raw-distance kernel so D-loop/address math constant-folds and `x_sq` is omitted from the argmin score because it is constant across centroids for each row. L2 access-policy persistence for centroids and BK80 were tested and regressed.
+5. **Compile-time async `c_sq` copy for K>=256**: large enough K launches a distinct kernel variant that copies full `c_sq` tiles through `cp.async` with the centroid tile; the final partial K chunk uses the vectorized store path to avoid out-of-bounds 16B async copies. Full K chunks skip per-candidate K-bound checks in the epilogue, and full N tiles skip row-validity checks. For D=128 and K>=256, the hot BK=96/N_TILES=2 tile uses a D-specialized raw-distance kernel so D-loop/address math constant-folds and `x_sq` is omitted from the argmin score because it is constant across centroids for each row. L2 access-policy persistence for centroids and BK80 were tested and regressed.
 - `csrc/update/update_sorted.cu` — sorted-chunk centroid accumulator. Caller (`flash_kmeans_cuda/ops.py`) does `torch.sort` on cluster_ids per batch, gathers x rows, then this kernel walks BLOCK_N=256 sorted tokens per CTA emitting one atomicAdd per run × BLOCK_D feature chunks. Output: fp32 sums + int32 counts.
 - `csrc/update/update_finalize.cu` — `new[b,k] = where(count > 0, sums / count, old)` cast to compute dtype. Trivial 1D grid.
 

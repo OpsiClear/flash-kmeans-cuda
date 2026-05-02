@@ -49,7 +49,7 @@ def _can_skip_x_sq_for_assign(x: torch.Tensor, n_clusters: int) -> bool:
     """True when assign_sm80's D=128 raw path cannot read x_sq."""
     if x.dtype != torch.float16:
         return False
-    if x.shape[-1] != 128 or n_clusters < 2048:
+    if x.shape[-1] != 128 or n_clusters < 256:
         return False
     if not _ntiles_allows_d128_raw_path():
         return False
@@ -144,7 +144,7 @@ def batch_kmeans_Euclid(
     B, N, D = x.shape
 
     if _can_skip_x_sq_for_assign(x, n_clusters):
-        # The D=128/K>=2048 raw assign path scores c_sq - 2*x@c. x_sq is
+        # The D=128/K>=256 raw assign path scores c_sq - 2*x@c. x_sq is
         # row-constant for argmin, so a correctly routed kernel never reads it.
         x_sq = torch.empty((B, N), device=x.device, dtype=torch.float32)
     else:

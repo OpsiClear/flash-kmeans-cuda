@@ -817,9 +817,9 @@ void launch_assign_sm80(const at::Tensor& x,
   };
   auto try_launch_widek96_2_w8_n2_d128 = [&](auto t) -> bool {
     using T = decltype(t);
-    if (D != 128 || K < 2048 || smem_widek96_2stage > smem_limit) return false;
+    if (D != 128 || K < 256 || smem_widek96_2stage > smem_limit) return false;
     // Raw distance trims the hot epilogue and lets the Python loop skip x_sq.
-    if (K >= 2048) {
+    if (K >= 256) {
       launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, true>(
           x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
     } else {

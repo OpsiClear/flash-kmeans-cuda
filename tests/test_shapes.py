@@ -31,9 +31,9 @@ def test_shape(B, N, K, D):
     assert (ids >= 0).all() and (ids < K).all()
 
 
-@pytest.mark.parametrize("K", [2048, 4096, 8192])
+@pytest.mark.parametrize("K", [256, 2048, 4096, 8192])
 def test_large_k_raw_kmeans_assignment_matches_reference(K):
-    """K>=2048 D=128 uses the raw assign path where x_sq is intentionally unused."""
+    """K>=256 D=128 uses the raw assign path where x_sq is intentionally unused."""
     torch.manual_seed(123)
     B, N, D = 1, 256, 128
     x = torch.randn(B, N, D, device="cuda", dtype=torch.float16)
