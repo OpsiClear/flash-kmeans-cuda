@@ -102,7 +102,7 @@ def centroid_update_sorted(
     else:
         counts_out.zero_()
 
-    if x.dtype == torch.float16 and D == 128 and K >= 4096:
+    if x.dtype == torch.float16 and D == 128 and K >= 2048:
         perm = perm.contiguous().to(torch.int32)
         _C.centroid_update_sorted_indexed(x, perm, sorted_ids, sums_out, counts_out)
     else:
