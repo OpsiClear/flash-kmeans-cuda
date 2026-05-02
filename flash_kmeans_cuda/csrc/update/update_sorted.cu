@@ -138,9 +138,15 @@ update_sorted_indexed_kernel(
   float* sumb = centroid_sums + (size_t)pid_b * K * D;
   int32_t* cntb = centroid_counts + (size_t)pid_b * K;
 
+  __shared__ int32_t s_idx[BLOCK_N];
+  for (int i = tid; i < n_count; i += THREADS_PER_CTA) {
+    s_idx[i] = idx[n_start + i];
+  }
+
   __shared__ int32_t s_run_cid;
   __shared__ int s_run_start;
   __shared__ int s_run_len;
+  __syncthreads();
 
   int cursor = 0;
   while (cursor < n_count) {
@@ -163,7 +169,7 @@ update_sorted_indexed_kernel(
         float acc = 0.f;
         #pragma unroll 4
         for (int r = 0; r < run_len; ++r) {
-          int row = idx[n_start + run_start + r];
+          int row = s_idx[run_start + r];
           T v = xb[(size_t)row * D + d];
           acc += to_fp32(v);
         }
