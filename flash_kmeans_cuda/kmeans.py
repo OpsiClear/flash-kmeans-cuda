@@ -28,7 +28,7 @@ def _ntiles_allows_d128_raw_path() -> bool:
         parsed = int(value)
     except ValueError:
         return False
-    return parsed not in (1, 4)
+    return parsed in (1, 2, 4)
 
 
 def _smem_limit(device: torch.device) -> int:

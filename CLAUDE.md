@@ -111,6 +111,7 @@ Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
 - Centroid update uses the original materialized `x_sorted` path below K=256 because contiguous reads beat indexed random row loads there. For fp16 D=128/K>=256, `centroid_update_sorted_indexed` consumes the sorted permutation directly and avoids materializing the full `(B,N,D)` `x_sorted` copy, which wins on med/big/huge/mega after shared-index caching.
 - The sorted-update path trusts `torch.sort` to preserve the already-int32 cluster-id dtype and only calls `.contiguous()` on `sorted_ids`; the old `.to(torch.int32)` was redundant in the hot wrapper.
 - The indexed mega update caches each CTA's 256 sorted row indices in shared memory before the feature loop. That avoids rereading the same global `sorted_idx` value from all 128 feature threads in the run accumulator.
+- The D=128 raw assign path now has N_TILES=1/2/4 specializations. Default routing keeps N_TILES=2 for med/big/huge and uses N_TILES=4 for the K>=8192 mega bucket, where 10-iter quality timing improved from 65.86 ms forced-N2 to 64.61 ms auto-N4 on the same binary.
 
 **Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
 
@@ -141,14 +142,14 @@ We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9
 | med (N=32K, K=256) | 0.176 | 0.580 | **3.30×** |
 | big (N=131K, K=2048) | 0.603 | 1.130 | **1.87×** |
 | huge (N=262K, K=4096) | 1.683 | 3.183 | **1.89×** |
-| mega (N=524K, K=8192) | 6.423 | 12.540 | **1.95×** |
+| mega (N=524K, K=8192) | 6.38 | 10.97 | **1.72×** |
 
 Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the pytorch-comparison auto-tune at 17.8× speedup; landed at 19.7× on big and 20.0× on huge. Wins:
 1. **fp16 accumulator** (`mma.f16.f16.f16`): 2× tensor-core throughput on Ada vs fp32 acc. Per-atom acc is 2 packed-fp16 regs/thread (vs 4 fp32). Acc is unpacked to fp32 in the epilogue's distance compute.
 2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
 3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
 4. **Tile dispatch chain**: `widek128_2_w8 → widek96_2_w8 → wide_3_w8 → wide_3_w4 → wide_2_w4 → narrow_4 → deep_2_w4`. Picks the largest that fits the device's per-block SMEM.
-5. **Compile-time async `c_sq` copy for K>=256**: large enough K launches a distinct kernel variant that copies full `c_sq` tiles through `cp.async` with the centroid tile; the final partial K chunk uses the vectorized store path to avoid out-of-bounds 16B async copies. Full K chunks skip per-candidate K-bound checks in the epilogue, and full N tiles skip row-validity checks. For D=128 and K>=256, the hot BK=96/N_TILES=2 tile uses a D-specialized raw-distance kernel so D-loop/address math constant-folds and `x_sq` is omitted from the argmin score because it is constant across centroids for each row. L2 access-policy persistence for centroids and BK80 were tested and regressed.
+5. **Compile-time async `c_sq` copy for K>=256**: large enough K launches a distinct kernel variant that copies full `c_sq` tiles through `cp.async` with the centroid tile; the final partial K chunk uses the vectorized store path to avoid out-of-bounds 16B async copies. Full K chunks skip per-candidate K-bound checks in the epilogue, and full N tiles skip row-validity checks. For D=128 and K>=256, the hot BK=96/N_TILES={1,2,4} tile uses a D-specialized raw-distance kernel so D-loop/address math constant-folds and `x_sq` is omitted from the argmin score because it is constant across centroids for each row. L2 access-policy persistence for centroids and BK80 were tested and regressed.
 - `csrc/update/update_sorted.cu` — sorted-chunk centroid accumulator. Caller (`flash_kmeans_cuda/ops.py`) does `torch.sort` on cluster_ids per batch, gathers x rows, then this kernel walks BLOCK_N=256 sorted tokens per CTA emitting one atomicAdd per run × BLOCK_D feature chunks. Output: fp32 sums + int32 counts.
 - `csrc/update/update_finalize.cu` — `new[b,k] = where(count > 0, sums / count, old)` cast to compute dtype. Trivial 1D grid.
 

@@ -808,6 +808,13 @@ void launch_assign_sm80(const at::Tensor& x,
                                               B, N, K, D, stream, async_csq);
     return true;
   };
+  auto try_launch_widek96_2_w8_d128 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 128 || K < 256 || smem_widek96_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 128, 96, 8, 2, 1, 128, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
   auto try_launch_widek96_2_w8_n2 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_widek96_2stage > smem_limit) return false;
@@ -819,13 +826,8 @@ void launch_assign_sm80(const at::Tensor& x,
     using T = decltype(t);
     if (D != 128 || K < 256 || smem_widek96_2stage > smem_limit) return false;
     // Raw distance trims the hot epilogue and lets the Python loop skip x_sq.
-    if (K >= 256) {
-      launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, true>(
-          x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
-    } else {
-      launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, false>(
-          x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
-    }
+    launch_typed_select_csq<T, 128, 96, 8, 2, 2, 128, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
     return true;
   };
   auto try_launch_widek128_2_w8_n4 = [&](auto t) -> bool {
@@ -840,6 +842,13 @@ void launch_assign_sm80(const at::Tensor& x,
     if (smem_widek96_2stage > smem_limit) return false;
     launch_typed_select_csq<T, 128, 96, 8, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
                                                  B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_widek96_2_w8_n4_d128 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 128 || K < 256 || smem_widek96_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 128, 96, 8, 2, 4, 128, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
     return true;
   };
   // BLOCK_N=64, BLOCK_K=64, 4 warps, 4 stages — deepest async pipeline that
@@ -916,19 +925,21 @@ void launch_assign_sm80(const at::Tensor& x,
   // last-resort fallback before deep when SMEM is tight on unusual shapes.
   bool prefer_w8 = (K >= 128);
 
-  // Persistent N-tile knob. Default 2 — empirically wins or ties N_TILES=1
-  // across med/big/huge/mega shapes on Ada (RTX 4090). Halving the launch
-  // count amortizes per-tile prologue (x_tile load + xs/c_sq cache + epilogue)
-  // over 2 N-tiles per CTA; the inter-tile cp.async drain costs less than
-  // the saved setup. Override with FKC_NTILES={1,2,4} to re-A/B.
+  // Persistent N-tile knob. Default is auto: N_TILES=2 for most shapes, and
+  // N_TILES=4 for the D=128/K>=8192 mega bucket where longer persistent CTAs
+  // reduce end-to-end time. Override with FKC_NTILES={1,2,4} to re-A/B.
   static const int n_tiles_env = []() {
     const char* s = std::getenv("FKC_NTILES");
-    if (!s) return 2;
+    if (!s) return 0;
     int v = std::atoi(s);
     if (v == 1) return 1;
+    if (v == 2) return 2;
     if (v == 4) return 4;
-    return 2;
+    return 0;
   }();
+  const int n_tiles_choice = (n_tiles_env != 0)
+      ? n_tiles_env
+      : ((D == 128 && K >= 8192) ? 4 : 2);
 
   // 3-stage wide tile experiment knob. FKC_WIDE3=1 forces BN=128 BK=64 8w
   // 3-stage instead of the BK=128/96 2-stage default. Smaller BK fits a
@@ -980,21 +991,23 @@ void launch_assign_sm80(const at::Tensor& x,
           }
           if (try_launch_wide_3_w8(t))      return true;
         }
-        // Default (n_tiles_env=2) tries the N_TILES=2 wide variants first;
+        // Default auto usually tries the N_TILES=2 wide variants first;
         // falls through to N_TILES=1 path on SMEM miss or when env forces 1.
         // BK=112 (intermediate, fits SMEM where 128 doesn't) was tested
         // and regressed 16% on mega vs BK=96 — register pressure from 14
         // N-atoms × 2 acc regs + 14 B regs / thread tipped past nvcc's
         // sweet spot. Reverted; left history in commit.
-        if (n_tiles_env == 2) {
+        if (n_tiles_choice == 2) {
           if (try_launch_widek128_2_w8_n2(t)) return true;
           if (try_launch_widek96_2_w8_n2_d128(t)) return true;
           if (try_launch_widek96_2_w8_n2(t))  return true;
-        } else if (n_tiles_env == 4) {
+        } else if (n_tiles_choice == 4) {
           if (try_launch_widek128_2_w8_n4(t)) return true;
+          if (try_launch_widek96_2_w8_n4_d128(t)) return true;
           if (try_launch_widek96_2_w8_n4(t))  return true;
         }
         return try_launch_widek128_2_w8(t) ||
+               try_launch_widek96_2_w8_d128(t) ||
                try_launch_widek96_2_w8(t) ||
                try_launch_wide_3_w8(t) ||
                try_launch_wide_3_w4(t) ||
