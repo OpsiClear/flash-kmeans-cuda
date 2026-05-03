@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(flash_kmeans_cuda LANGUAGES CXX CUDA)
 
 option(FKC_BUILD_SHARED_LIB "Build the flash-kmeans-cuda shared library" ON)
+option(FKC_BUILD_CPP_SMOKE "Build the standalone C++ smoke test executable" OFF)
 
 if(NOT FKC_BUILD_SHARED_LIB)
   return()
@@ -122,3 +123,27 @@ configure_package_config_file(
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/flash_kmeans_cudaConfig.cmake"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/flash_kmeans_cuda"
 )
+
+if(FKC_BUILD_CPP_SMOKE)
+  add_executable(flash_kmeans_cuda_cpp_smoke
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/smoke.cpp"
+  )
+  target_link_libraries(flash_kmeans_cuda_cpp_smoke
+    PRIVATE
+      flash_kmeans_cuda::flash_kmeans_cuda
+  )
+  target_include_directories(flash_kmeans_cuda_cpp_smoke
+    PRIVATE
+      "${FKC_CSRC}"
+  )
+  if(TORCH_CXX_FLAGS)
+    target_compile_options(flash_kmeans_cuda_cpp_smoke PRIVATE ${FKC_TORCH_CXX_FLAGS})
+  endif()
+  if(MSVC)
+    target_compile_options(flash_kmeans_cuda_cpp_smoke
+      PRIVATE /O2 /EHsc /bigobj /Zc:preprocessor
+    )
+  else()
+    target_compile_options(flash_kmeans_cuda_cpp_smoke PRIVATE -O3)
+  endif()
+endif()

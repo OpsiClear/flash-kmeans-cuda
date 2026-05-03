@@ -126,9 +126,14 @@ jobs:
           uv run --no-sync cmake -S . -B build-shared -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="${torch_prefix}" \
-            -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}"
-          uv run --no-sync cmake --build build-shared --target flash_kmeans_cuda --parallel 2
+            -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
+            -DFKC_BUILD_CPP_SMOKE=ON
+          uv run --no-sync cmake --build build-shared --target flash_kmeans_cuda_cpp_smoke --parallel 2
           uv run --no-sync cmake --install build-shared --prefix build-shared/install
+          uv run --no-sync cmake -S tests/cpp/consumer -B build-shared/consumer-test -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/build-shared/install;${torch_prefix}"
+          uv run --no-sync cmake --build build-shared/consumer-test --target consumer_smoke --parallel 2
           tar -C build-shared/install -czf dist/ci-linux-shared.tar.gz .
 
       - name: Upload Linux build artifacts
