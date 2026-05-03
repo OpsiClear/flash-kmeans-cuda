@@ -90,3 +90,55 @@ def test_autotune_disabled_uses_static_order():
     assert "[fkc autotune]" not in proc.stderr, (
         f"expected no probe lines with FKC_AUTOTUNE=0, got:\n{proc.stderr}"
     )
+
+
+def test_autotune_concurrent_first_call_single_probe():
+    """Two host threads launching assign on the same shape concurrently must
+    cause exactly one probe (the second thread sees probed=true and reuses).
+
+    Run in a subprocess to keep VERBOSE output clean.
+    """
+    script = r"""
+import os
+os.environ['FKC_AUTOTUNE_VERBOSE'] = '1'
+import threading
+import torch
+from flash_kmeans_cuda import _C
+
+torch.manual_seed(0)
+B, N, K, D = 1, 2048, 256, 128
+x = torch.randn(B, N, D, device='cuda', dtype=torch.float16)
+centroids = x[:, :K].contiguous()
+x_sq = (x.float() ** 2).sum(-1).contiguous()
+c_sq = (centroids.float() ** 2).sum(-1).contiguous()
+
+barrier = threading.Barrier(4)
+
+def worker():
+    barrier.wait()
+    for _ in range(3):
+        _C.euclid_assign(x, centroids, x_sq, c_sq, None)
+
+threads = [threading.Thread(target=worker) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+torch.cuda.synchronize()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr
+    # Expect probe lines for ONE (D=128, k_bucket=1) cell only — exactly
+    # min(3, n_feasible) lines, which for D=128 mid-K is 3.
+    probes = re.findall(r"\[fkc autotune\].* probe\[\d+\]=", proc.stderr)
+    cells = set(
+        re.findall(r"D_idx=(\d+) k_bucket=(\d+)", proc.stderr)
+    )
+    assert len(cells) == 1, (
+        f"expected exactly 1 cell probed under concurrent load, got "
+        f"{len(cells)} cells: {cells}\n{proc.stderr}"
+    )
+    assert 1 <= len(probes) <= 3, (
+        f"expected 1-3 probe lines for one cell, got {len(probes)}:\n{proc.stderr}"
+    )
