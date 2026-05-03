@@ -280,6 +280,14 @@ assign_sm80_dslab_kernel(
           issue_csq(chunk_idx, stage);
         }
         ptx::cp_async_commit();
+        // PIPE_STAGES > 1 is currently STRUCTURALLY INERT in the dslab kernel:
+        // cp_async_wait_all() here drains every outstanding cp.async group, so
+        // c_slab_smem only ever needs one stage's worth of SMEM. Catalog entries
+        // should pass STAGES=1 to avoid wasting ~32 KB of SMEM per CTA at
+        // BK=128. A future change could replace wait_all with
+        // cp_async_wait_group<0> and overlap slab N+1's load with slab N's
+        // mma — that would unlock real PIPE_STAGES > 1 benefit, but is out of
+        // scope for this kernel.
         ptx::cp_async_wait_all();
         __syncthreads();
 

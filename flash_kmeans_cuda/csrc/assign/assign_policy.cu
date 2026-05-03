@@ -87,9 +87,9 @@ constexpr Variant V_WIDE_3_W8_N2_D256    = make_variant<128,  64, 8, 3, 2, 256, 
 // Per-D template instantiations with compile-time partition baked in.
 // SLAB_MAX = 128, max 4 slabs per partition (zero-padded for fewer).
 constexpr Variant V_DSLAB_W8_N2_D256 =
-    make_dslab_variant<128, 128, 8, 2, 2, 256, 128, 128, 0, 0>("dslab_w8_n2_d256");
+    make_dslab_variant<128, 128, 8, 1, 2, 256, 128, 128, 0, 0>("dslab_w8_n2_d256");
 constexpr Variant V_DSLAB_W8_D256 =
-    make_dslab_variant<128, 128, 8, 2, 1, 256, 128, 128, 0, 0>("dslab_w8_d256");
+    make_dslab_variant<128, 128, 8, 1, 1, 256, 128, 128, 0, 0>("dslab_w8_d256");
 
 // =========================================================================
 // Generic-D fallback chain. Used by every cell as the tail of its candidate

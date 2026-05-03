@@ -3,8 +3,10 @@
 
 // D-slab variant factory: per-D template instantiation that holds one
 // 128-wide D-slab in SMEM at a time. SMEM footprint is D-independent at
-// SLAB_MAX=128, so every target D gets the same BN=128 BK=128 STAGES=2
-// 8-warp tile that the legacy kernel uses successfully at D=128.
+// SLAB_MAX=128, so every target D gets the same BN=128 BK=128 STAGES=1
+// 8-warp tile. STAGES=1 is the effective minimum: the slab loop's per-slab
+// cp_async_wait_all() makes PIPE_STAGES > 1 structurally inert (see
+// assign_sm80_dslab_kernel.cuh).
 
 #include "assign_kernel_launch.h"
 #include "assign_variants.h"
@@ -47,8 +49,10 @@ template <int BN, int BK, int W, int S, int NT,
 struct DSlabVariantSpec {
   static size_t smem(int /*D*/, size_t elt) {
     // D-slab layout: x_smem and c_smem each hold one SLAB_MAX-wide slab at
-    // a time, so the SMEM footprint is independent of D_FULL. About 97 KB
-    // for the BN=128 BK=128 STAGES=2 8-warp tile at SLAB_MAX=128.
+    // a time, so the SMEM footprint is independent of D_FULL. About 65 KB
+    // for the BN=128 BK=128 STAGES=1 8-warp tile at SLAB_MAX=128 (the slab
+    // loop's per-slab cp.async wait_all makes PIPE_STAGES > 1 inert; see
+    // assign_sm80_dslab_kernel.cuh).
     size_t row = (size_t)(SLAB_MAX + SMEM_PAD_SLAB);
     return BN * row * elt
          + (size_t)S * BK * row * elt
