@@ -44,6 +44,7 @@
 //   first); a future patch can pad the row stride.
 
 #include "assign.h"
+#include "assign_kernel_launch.h"
 #include "assign_common.cuh"
 #include "../common/arch.cuh"
 #include "../common/ptx.cuh"
@@ -67,13 +68,9 @@ namespace {
 // template; tile sizes are template parameters.
 
 constexpr int BLOCK_D = 16;
-// SMEM row-stride padding (in fp16 elements). Adding 8 fp16 = 16 bytes
-// preserves cp.async's required 16-byte alignment of the destination
-// SMEM offset for every row, while shifting each subsequent SMEM row by
-// 4 banks. Without padding, power-of-2 D (64/128/256) causes 32-way bank
-// conflicts across rows; with this padding, the 8 cooperating row-bank
-// offsets land on distinct 4-byte banks.
-constexpr int SMEM_PAD = 8;
+// SMEM_PAD is defined in assign_kernel_launch.h (in the fkc::assign namespace)
+// and is accessible here because this anonymous namespace is nested inside
+// fkc::assign.
 
 // FP16 accumulator path (2x mma throughput on Ada vs fp32 acc).
 // Per atom: 2 packed-fp16 regs/thread instead of 4 fp32. Only fp16 input
@@ -172,9 +169,13 @@ __device__ __forceinline__ void store_csq_tile(
     v.w = (i + 3 < cols) ? gmem_tile[i + 3] : 0.f;
     *reinterpret_cast<float4*>(&smem_tile[i]) = v;
   }
-}
+}  // store_csq_tile
+
+}  // anonymous namespace (helper device functions only)
 
 
+// assign_sm80_kernel is defined at fkc::assign scope (not anonymous) so that
+// the forward declaration in assign_kernel_launch.h can reference it.
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
           int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0,
           bool RAW_DIST = false>
@@ -638,69 +639,6 @@ assign_sm80_kernel(
     __syncthreads();
   }
   }  // n_tile loop
-}
-
-}  // namespace
-
-
-// Helper: compute SMEM bytes for a given tile (x_smem + PIPE_STAGES *
-// (c_smem + c_sq_smem); x_sq lives in registers).
-static inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
-                                        int PIPE_STAGES_, size_t elt_sz) {
-  int D_SMEM = D + SMEM_PAD;
-  return (size_t)BLOCK_N_ * D_SMEM * elt_sz +
-         (size_t)PIPE_STAGES_ * BLOCK_K_ * D_SMEM * elt_sz +
-         (size_t)PIPE_STAGES_ * BLOCK_K_ * sizeof(float);
-}
-
-template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, bool ASYNC_CSQ_ = false, int D_FIXED_ = 0,
-          bool RAW_DIST_ = false>
-static void launch_typed(
-    const at::Tensor& x,
-    const at::Tensor& centroids,
-    const at::Tensor& x_sq,
-    const at::Tensor& c_sq,
-    at::Tensor& cluster_ids,
-    int B, int N, int K, int D,
-    cudaStream_t stream) {
-  size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, D, STAGES_, sizeof(T));
-  auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_,
-                               N_TILES_, ASYNC_CSQ_, D_FIXED_, RAW_DIST_>;
-  if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem_bytes));
-  }
-  // Persistent kernel: each CTA handles N_TILES_ contiguous BLOCK_N_ rows.
-  const int rows_per_cta = BLOCK_N_ * N_TILES_;
-  dim3 grid((N + rows_per_cta - 1) / rows_per_cta, B);
-  dim3 block(WARPS_ * 32);
-  fn<<<grid, block, smem_bytes, stream>>>(
-      reinterpret_cast<const T*>(x.data_ptr()),
-      reinterpret_cast<const T*>(centroids.data_ptr()),
-      x_sq.data_ptr<float>(), c_sq.data_ptr<float>(),
-      cluster_ids.data_ptr<int32_t>(),
-      B, N, K, D);
-}
-
-template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, int D_FIXED_ = 0, bool RAW_DIST_ = true>
-static void launch_typed_select_csq(
-    const at::Tensor& x,
-    const at::Tensor& centroids,
-    const at::Tensor& x_sq,
-    const at::Tensor& c_sq,
-    at::Tensor& cluster_ids,
-    int B, int N, int K, int D,
-    cudaStream_t stream,
-    bool async_csq) {
-  if (async_csq) {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_, RAW_DIST_>(
-        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
-  } else {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_, RAW_DIST_>(
-        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
-  }
 }
 
 
