@@ -59,27 +59,27 @@ constexpr Variant V_DEEP_2_W4           = make_variant< 64, 128, 4, 2, 1>("deep_
 
 // === Stage 2 additions ===================================================
 // Wide BK=96 D-specialized (n_tiles=1 and n_tiles=2 each).
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_D64       = make_variant<128,  96, 8, 2, 1,  64, true>("widek96_w8_d64");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_D96       = make_variant<128,  96, 8, 2, 1,  96, true>("widek96_w8_d96");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_D192      = make_variant<128,  96, 8, 2, 1, 192, true>("widek96_w8_d192");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_D224      = make_variant<128,  96, 8, 2, 1, 224, true>("widek96_w8_d224");
+constexpr Variant V_WIDEK96_W8_D64       = make_variant<128,  96, 8, 2, 1,  64, true>("widek96_w8_d64");
+constexpr Variant V_WIDEK96_W8_D96       = make_variant<128,  96, 8, 2, 1,  96, true>("widek96_w8_d96");
+constexpr Variant V_WIDEK96_W8_D192      = make_variant<128,  96, 8, 2, 1, 192, true>("widek96_w8_d192");
+constexpr Variant V_WIDEK96_W8_D224      = make_variant<128,  96, 8, 2, 1, 224, true>("widek96_w8_d224");
 
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_N2_D64    = make_variant<128,  96, 8, 2, 2,  64, true>("widek96_w8_n2_d64");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_N2_D96    = make_variant<128,  96, 8, 2, 2,  96, true>("widek96_w8_n2_d96");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_N2_D192   = make_variant<128,  96, 8, 2, 2, 192, true>("widek96_w8_n2_d192");
-[[maybe_unused]] constexpr Variant V_WIDEK96_W8_N2_D224   = make_variant<128,  96, 8, 2, 2, 224, true>("widek96_w8_n2_d224");
+constexpr Variant V_WIDEK96_W8_N2_D64    = make_variant<128,  96, 8, 2, 2,  64, true>("widek96_w8_n2_d64");
+constexpr Variant V_WIDEK96_W8_N2_D96    = make_variant<128,  96, 8, 2, 2,  96, true>("widek96_w8_n2_d96");
+constexpr Variant V_WIDEK96_W8_N2_D192   = make_variant<128,  96, 8, 2, 2, 192, true>("widek96_w8_n2_d192");
+constexpr Variant V_WIDEK96_W8_N2_D224   = make_variant<128,  96, 8, 2, 2, 224, true>("widek96_w8_n2_d224");
 
 // Wide BK=128 D-specialized (only D=64,96 fit SMEM; D=128 already exists).
-[[maybe_unused]] constexpr Variant V_WIDEK128_W8_D64      = make_variant<128, 128, 8, 2, 1,  64, true>("widek128_w8_d64");
-[[maybe_unused]] constexpr Variant V_WIDEK128_W8_D96      = make_variant<128, 128, 8, 2, 1,  96, true>("widek128_w8_d96");
+constexpr Variant V_WIDEK128_W8_D64      = make_variant<128, 128, 8, 2, 1,  64, true>("widek128_w8_d64");
+constexpr Variant V_WIDEK128_W8_D96      = make_variant<128, 128, 8, 2, 1,  96, true>("widek128_w8_d96");
 
 // 3-stage wide BK=64 D-specialized for the larger D values.
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_D192       = make_variant<128,  64, 8, 3, 1, 192, true>("wide_3_w8_d192");
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_D224       = make_variant<128,  64, 8, 3, 1, 224, true>("wide_3_w8_d224");
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_D256       = make_variant<128,  64, 8, 3, 1, 256, true>("wide_3_w8_d256");
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_N2_D192    = make_variant<128,  64, 8, 3, 2, 192, true>("wide_3_w8_n2_d192");
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_N2_D224    = make_variant<128,  64, 8, 3, 2, 224, true>("wide_3_w8_n2_d224");
-[[maybe_unused]] constexpr Variant V_WIDE_3_W8_N2_D256    = make_variant<128,  64, 8, 3, 2, 256, true>("wide_3_w8_n2_d256");
+constexpr Variant V_WIDE_3_W8_D192       = make_variant<128,  64, 8, 3, 1, 192, true>("wide_3_w8_d192");
+constexpr Variant V_WIDE_3_W8_D224       = make_variant<128,  64, 8, 3, 1, 224, true>("wide_3_w8_d224");
+constexpr Variant V_WIDE_3_W8_D256       = make_variant<128,  64, 8, 3, 1, 256, true>("wide_3_w8_d256");
+constexpr Variant V_WIDE_3_W8_N2_D192    = make_variant<128,  64, 8, 3, 2, 192, true>("wide_3_w8_n2_d192");
+constexpr Variant V_WIDE_3_W8_N2_D224    = make_variant<128,  64, 8, 3, 2, 224, true>("wide_3_w8_n2_d224");
+constexpr Variant V_WIDE_3_W8_N2_D256    = make_variant<128,  64, 8, 3, 2, 256, true>("wide_3_w8_n2_d256");
 
 // =========================================================================
 // Generic-D fallback chain. Used by every cell as the tail of its candidate
@@ -97,15 +97,15 @@ constexpr PolicyRow kGenericFallback = {
 // =========================================================================
 
 constexpr PolicyRow kD64 = {
-  &V_WIDEK128_W8_N2_D64, &V_WIDEK128_W8_N2, &V_WIDEK96_W8_N2,
-  &V_WIDEK128_W8, &V_WIDEK96_W8, &V_WIDE_3_W8,
-  &V_NARROW_4, &V_DEEP_2_W4,
+  &V_WIDEK128_W8_N2_D64, &V_WIDEK128_W8_D64, &V_WIDEK96_W8_N2_D64,
+  &V_WIDEK96_W8_D64, &V_WIDEK128_W8_N2, &V_WIDEK96_W8_N2,
+  &V_WIDE_3_W8, &V_NARROW_4,
 };
 
 constexpr PolicyRow kD96 = {
-  &V_WIDEK128_W8_N2_D96, &V_WIDEK128_W8_N2, &V_WIDEK96_W8_N2,
-  &V_WIDEK128_W8, &V_WIDEK96_W8, &V_WIDE_3_W8,
-  &V_NARROW_4, &V_DEEP_2_W4,
+  &V_WIDEK128_W8_N2_D96, &V_WIDEK128_W8_D96, &V_WIDEK96_W8_N2_D96,
+  &V_WIDEK96_W8_D96, &V_WIDEK128_W8_N2, &V_WIDEK96_W8_N2,
+  &V_WIDE_3_W8, &V_NARROW_4,
 };
 
 constexpr PolicyRow kD128 = {
@@ -115,21 +115,21 @@ constexpr PolicyRow kD128 = {
 };
 
 constexpr PolicyRow kD192 = {
-  &V_NARROWK32_W4_N2_D192, &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
-  &V_WIDE_3_W8, &V_WIDE_3_W4, &V_NARROW_4,
-  &V_DEEP_2_W4, nullptr,
+  &V_WIDEK96_W8_N2_D192, &V_WIDEK96_W8_D192, &V_WIDE_3_W8_N2_D192,
+  &V_WIDE_3_W8_D192, &V_NARROWK32_W4_N2_D192, &V_NARROWK32_W4_N2,
+  &V_NARROWK32_W4, &V_NARROW_4,
 };
 
 constexpr PolicyRow kD224 = {
-  &V_NARROWK32_W4_N2_D224, &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
-  &V_WIDE_3_W8, &V_WIDE_3_W4, &V_NARROW_4,
-  &V_DEEP_2_W4, nullptr,
+  &V_WIDEK96_W8_N2_D224, &V_WIDEK96_W8_D224, &V_WIDE_3_W8_N2_D224,
+  &V_WIDE_3_W8_D224, &V_NARROWK32_W4_N2_D224, &V_NARROWK32_W4_N2,
+  &V_NARROWK32_W4, &V_NARROW_4,
 };
 
 constexpr PolicyRow kD256 = {
-  &V_NARROWK32_W4_N2_D256, &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
-  &V_WIDE_3_W8, &V_WIDE_3_W4, &V_NARROW_4,
-  &V_DEEP_2_W4, nullptr,
+  &V_WIDE_3_W8_N2_D256, &V_WIDE_3_W8_D256, &V_NARROWK32_W4_N2_D256,
+  &V_NARROWK32_W4_N2, &V_NARROWK32_W4, &V_WIDE_3_W4,
+  &V_NARROW_4, &V_DEEP_2_W4,
 };
 
 constexpr PolicyRow kD320 = {
