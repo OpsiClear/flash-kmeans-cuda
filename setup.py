@@ -102,6 +102,7 @@ sources = [
     str(CSRC / "bindings.cpp"),
     str(CSRC / "assign" / "assign_safe.cu"),
     str(CSRC / "assign" / "assign_sm80.cu"),
+    str(CSRC / "assign" / "assign_policy.cu"),
     str(CSRC / "update" / "update_sorted.cu"),
     str(CSRC / "update" / "update_finalize.cu"),
     str(NB_COMBINED),
