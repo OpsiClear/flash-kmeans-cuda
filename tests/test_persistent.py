@@ -5,11 +5,8 @@ Specifically guards against the failure modes Agent 3 flagged:
 - best[]/xs_*_cache state leaking between tiles
 - Tail handling when N is not a multiple of (BLOCK_N * N_TILES_PER_CTA)
 
-The kernel selects N_TILES via the FKC_NTILES env var; we toggle it inside
-each test via os.environ since the kernel reads it once at first launch.
-But because the env is read into a function-local static the first time
-launch_assign_sm80 is called, we can't actually flip it after that — so
-each subprocess test runs with a fixed env value via subprocess launch.
+The kernel selects N_TILES via the FKC_NTILES env var, which is read on every
+launch by read_env_knobs(), so we toggle it inline within each test.
 """
 
 from __future__ import annotations
@@ -19,100 +16,62 @@ import subprocess
 import sys
 
 import pytest
-
-
-# Run each (n_tiles_value, test_fn) combination in its own subprocess so that
-# the kernel's static env-var read picks up the right value.
-_SCRIPT = r"""
-import os, sys
-os.environ['FKC_NTILES'] = sys.argv[1]
 import torch
+
 from flash_kmeans_cuda import _C
 
-mode = sys.argv[2]
-torch.manual_seed(7)
 
-if mode == 'identity':
-    # Centroids ARE the first K input rows -> rows 0..K-1 must map to themselves
-    # (the argmin is trivially the matching index because dist=0 for that k).
-    # Rows K..N-1 are unrelated random points and can map anywhere.
-    B, N, K, D = 1, 4096, 64, 128
-    x = torch.randn(B, N, D, device='cuda', dtype=torch.float16)
-    centroids = x[:, :K].contiguous()
-    x_sq = (x.float() ** 2).sum(-1).contiguous()
-    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
-    ids = _C.euclid_assign(x, centroids, x_sq, c_sq, None)
-    expected = torch.arange(K, device='cuda', dtype=torch.int32)
-    matches = (ids[0, :K] == expected).float().mean().item()
-    print(f'identity_match={matches:.6f}')
-    sys.exit(0 if matches > 0.99 else 1)
-
-elif mode == 'tail':
-    # N = BLOCK_N * N_TILES_PER_CTA + 1 -> tail CTA processes only 1 row.
-    # BLOCK_N=128, N_TILES=2 -> N=257 puts last CTA at n_tile=0 with 1 row,
-    # tile 1 hits n_count=0 break.
-    B, N, K, D = 1, 257, 16, 128
-    x = torch.randn(B, N, D, device='cuda', dtype=torch.float16)
-    centroids = x[:, :K].contiguous()
-    x_sq = (x.float() ** 2).sum(-1).contiguous()
-    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
-    ids = _C.euclid_assign(x, centroids, x_sq, c_sq, None)
-    # All ids in valid range, last row not garbage.
-    in_range = ((ids >= 0) & (ids < K)).all().item()
-    # First K rows should land on themselves (identity centroids).
-    self_match = (ids[0, :K] == torch.arange(K, device='cuda', dtype=torch.int32)).float().mean().item()
-    print(f'in_range={in_range} self_match={self_match:.4f}')
-    sys.exit(0 if (in_range and self_match > 0.95) else 1)
-
-elif mode == 'consistency':
-    # Run with whatever NTILES is set to, capture cluster_ids, then run again
-    # in the same process: must be deterministic across launches.
-    B, N, K, D = 1, 8192, 128, 128
-    x = torch.randn(B, N, D, device='cuda', dtype=torch.float16)
-    centroids = x[:, :K].contiguous()
-    x_sq = (x.float() ** 2).sum(-1).contiguous()
-    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
-    ids1 = _C.euclid_assign(x, centroids, x_sq, c_sq, None).clone()
-    ids2 = _C.euclid_assign(x, centroids, x_sq, c_sq, None).clone()
-    same = (ids1 == ids2).all().item()
-    print(f'deterministic={same}')
-    sys.exit(0 if same else 1)
-
-else:
-    print(f'unknown mode {mode}')
-    sys.exit(2)
-"""
-
-
-def _run(ntiles: str, mode: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        [sys.executable, "-c", _SCRIPT, ntiles, mode],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return proc.returncode, proc.stdout + proc.stderr
+def _set_ntiles(ntiles: str):
+    os.environ["FKC_NTILES"] = ntiles
 
 
 @pytest.mark.parametrize("ntiles", ["1", "2", "4"])
 def test_identity_centroids(ntiles):
     """First K rows of x as centroids -> argmin trivially picks row index."""
-    rc, out = _run(ntiles, "identity")
-    assert rc == 0, f"FKC_NTILES={ntiles} identity failed:\n{out}"
+    _set_ntiles(ntiles)
+    torch.manual_seed(7)
+    B, N, K, D = 1, 4096, 64, 128
+    x = torch.randn(B, N, D, device="cuda", dtype=torch.float16)
+    centroids = x[:, :K].contiguous()
+    x_sq = (x.float() ** 2).sum(-1).contiguous()
+    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
+    ids = _C.euclid_assign(x, centroids, x_sq, c_sq, None)
+    expected = torch.arange(K, device="cuda", dtype=torch.int32)
+    matches = (ids[0, :K] == expected).float().mean().item()
+    assert matches > 0.99, f"FKC_NTILES={ntiles} identity_match={matches:.6f}"
 
 
 @pytest.mark.parametrize("ntiles", ["1", "2", "4"])
 def test_tail_short_remainder(ntiles):
     """N = 257 with BLOCK_N=128 forces a 1-row tail -- shouldn't OOB or break."""
-    rc, out = _run(ntiles, "tail")
-    assert rc == 0, f"FKC_NTILES={ntiles} tail failed:\n{out}"
+    _set_ntiles(ntiles)
+    torch.manual_seed(7)
+    B, N, K, D = 1, 257, 16, 128
+    x = torch.randn(B, N, D, device="cuda", dtype=torch.float16)
+    centroids = x[:, :K].contiguous()
+    x_sq = (x.float() ** 2).sum(-1).contiguous()
+    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
+    ids = _C.euclid_assign(x, centroids, x_sq, c_sq, None)
+    in_range = ((ids >= 0) & (ids < K)).all().item()
+    self_match = (ids[0, :K] == torch.arange(K, device="cuda", dtype=torch.int32)).float().mean().item()
+    assert in_range and self_match > 0.95, (
+        f"FKC_NTILES={ntiles}: in_range={in_range} self_match={self_match:.4f}"
+    )
 
 
 @pytest.mark.parametrize("ntiles", ["1", "2", "4"])
 def test_determinism(ntiles):
     """Same input must yield same cluster_ids on repeated launches."""
-    rc, out = _run(ntiles, "consistency")
-    assert rc == 0, f"FKC_NTILES={ntiles} non-deterministic:\n{out}"
+    _set_ntiles(ntiles)
+    torch.manual_seed(7)
+    B, N, K, D = 1, 8192, 128, 128
+    x = torch.randn(B, N, D, device="cuda", dtype=torch.float16)
+    centroids = x[:, :K].contiguous()
+    x_sq = (x.float() ** 2).sum(-1).contiguous()
+    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
+    ids1 = _C.euclid_assign(x, centroids, x_sq, c_sq, None).clone()
+    ids2 = _C.euclid_assign(x, centroids, x_sq, c_sq, None).clone()
+    assert (ids1 == ids2).all().item(), f"FKC_NTILES={ntiles} non-deterministic"
 
 
 def test_ntiles_invariance():
