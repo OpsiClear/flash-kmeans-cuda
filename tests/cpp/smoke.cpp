@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -27,11 +28,10 @@ at::Tensor reference_assign(
   return std::get<1>(dist.min(-1)).to(at::kInt);
 }
 
-void test_assign() {
+void test_assign(int64_t D) {
   constexpr int64_t B = 1;
   constexpr int64_t N = 512;
   constexpr int64_t K = 64;
-  constexpr int64_t D = 64;
 
   auto opts = at::TensorOptions().device(at::kCUDA).dtype(at::kHalf);
   at::Tensor x = at::randn({B, N, D}, opts).contiguous();
@@ -48,15 +48,14 @@ void test_assign() {
   check(ids.sizes() == at::IntArrayRef({B, N}), "assign output shape mismatch");
   check(ids.scalar_type() == at::kInt, "assign output dtype mismatch");
   const double disagreement = ids.ne(ref).to(at::kFloat).mean().item<double>();
-  std::cout << "assign disagreement=" << disagreement << "\n";
+  std::cout << "assign D=" << D << " disagreement=" << disagreement << "\n";
   check(disagreement < 0.05, "assign disagreement exceeds 5%");
 }
 
-void test_update_finalize() {
+void test_update_finalize(int64_t D) {
   constexpr int64_t B = 1;
   constexpr int64_t N = 512;
   constexpr int64_t K = 16;
-  constexpr int64_t D = 32;
 
   auto x_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
   auto i32_opts = at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
@@ -92,6 +91,7 @@ void test_update_finalize() {
       sums / counts.clamp_min(1).to(at::kFloat).unsqueeze(-1),
       old_centroids);
   check(at::allclose(finalized, ref, 1e-4, 1e-4), "finalize output mismatch");
+  std::cout << "update/finalize D=" << D << " passed\n";
 }
 
 }  // namespace
@@ -101,8 +101,12 @@ int main() {
     check(at::cuda::is_available(), "CUDA is not available");
     c10::cuda::CUDAGuard guard(0);
     at::manual_seed(0);
-    test_assign();
-    test_update_finalize();
+    for (int64_t D : std::vector<int64_t>{1, 7, 16, 31, 32, 48, 64, 96, 128, 256, 257}) {
+      test_assign(D);
+    }
+    for (int64_t D : std::vector<int64_t>{1, 7, 16, 31, 32, 64, 128, 257}) {
+      test_update_finalize(D);
+    }
     std::cout << "flash_kmeans_cuda C++ smoke test passed\n";
     return 0;
   } catch (const std::exception& e) {

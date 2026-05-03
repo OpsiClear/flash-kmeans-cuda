@@ -18,6 +18,12 @@ bool force_safe_path() {
   return v;
 }
 
+bool can_use_sm80_path(const at::Tensor& x) {
+  const auto dtype = x.scalar_type();
+  return (dtype == at::kHalf || dtype == at::kBFloat16) &&
+      x.size(2) % 16 == 0;
+}
+
 void validate_assign_inputs(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -57,9 +63,7 @@ at::Tensor euclid_assign_out(
     at::Tensor cluster_ids) {
   validate_assign_inputs(x, centroids, x_sq, c_sq, cluster_ids);
 
-  const auto dtype = x.scalar_type();
-  const bool tc_eligible = (dtype == at::kHalf || dtype == at::kBFloat16);
-  if (tc_eligible && !force_safe_path()) {
+  if (can_use_sm80_path(x) && !force_safe_path()) {
     fkc::assign::launch_assign_sm80(x, centroids, x_sq, c_sq, cluster_ids);
   } else {
     fkc::assign::launch_assign_safe(x, centroids, x_sq, c_sq, cluster_ids);

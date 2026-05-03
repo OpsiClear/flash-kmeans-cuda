@@ -220,8 +220,6 @@ assign_sm80_kernel(
   const int row_top_in_warp = lane / 4;             // 0..7  (within 16-row atom)
   const int row_bot_in_warp = row_top_in_warp + 8;  // 8..15
   const int col_in_atom = (lane % 4) * 2;           // 0,2,4,6 within an 8-wide atom
-  const int k_in_atom_lo = col_in_atom;             // K-half 0 col index in atom
-  const int k_in_atom_hi = col_in_atom + 8;         // K-half 1 col index in atom
 
   // ldmatrix lane-mapping constants (depend on lane only, not d_off / chunk).
   const int ldm_row_off    = (lane & 8)  ? 8 : 0;   // bit 3 -> M-half (A) / N-half (B)
@@ -417,8 +415,8 @@ assign_sm80_kernel(
       if (n_count == BLOCK_N) {
         #pragma unroll
         for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
-          const float xs_top = xs_top_cache[m];
-          const float xs_bot = xs_bot_cache[m];
+          [[maybe_unused]] const float xs_top = xs_top_cache[m];
+          [[maybe_unused]] const float xs_bot = xs_bot_cache[m];
 
           #pragma unroll
           for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
@@ -454,8 +452,8 @@ assign_sm80_kernel(
         for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
           const bool top_valid = top_valid_cache[m];
           const bool bot_valid = bot_valid_cache[m];
-          const float xs_top = xs_top_cache[m];
-          const float xs_bot = xs_bot_cache[m];
+          [[maybe_unused]] const float xs_top = xs_top_cache[m];
+          [[maybe_unused]] const float xs_bot = xs_bot_cache[m];
 
           #pragma unroll
           for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
@@ -499,8 +497,8 @@ assign_sm80_kernel(
       for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
         const bool top_valid = top_valid_cache[m];
         const bool bot_valid = bot_valid_cache[m];
-        const float xs_top = xs_top_cache[m];
-        const float xs_bot = xs_bot_cache[m];
+        [[maybe_unused]] const float xs_top = xs_top_cache[m];
+        [[maybe_unused]] const float xs_bot = xs_bot_cache[m];
 
         #pragma unroll
         for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
@@ -686,7 +684,7 @@ static void launch_typed(
 }
 
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
-          int N_TILES_ = 1, int D_FIXED_ = 0, bool RAW_DIST_ = false>
+          int N_TILES_ = 1, int D_FIXED_ = 0, bool RAW_DIST_ = true>
 static void launch_typed_select_csq(
     const at::Tensor& x,
     const at::Tensor& centroids,
@@ -798,6 +796,20 @@ void launch_assign_sm80(const at::Tensor& x,
                                                   B, N, K, D, stream, async_csq);
     return true;
   };
+  auto try_launch_widek128_2_w8_n2_d64 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 64 || smem_widek128_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 128, 128, 8, 2, 2, 64, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_widek128_2_w8_n2_d96 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 96 || smem_widek128_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 128, 128, 8, 2, 2, 96, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
   // BLOCK_N=128, BLOCK_K=96, 8 warps, 2 stages — bigger K-chunk = longer
   // per-warp mma queue (12 N-atoms), trades pipeline depth for arithmetic
   // throughput.
@@ -880,6 +892,48 @@ void launch_assign_sm80(const at::Tensor& x,
                                                 B, N, K, D, stream, async_csq);
     return true;
   };
+  auto try_launch_narrowk32_2_w4_n2_d192 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 192 || smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2, 192, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n2_d224 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 224 || smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2, 224, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n2_d256 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 256 || smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2, 256, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n2_d320 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 320 || smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2, 320, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n2_d384 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (D != 384 || smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 2, 384, true>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream, async_csq);
+    return true;
+  };
+  auto try_launch_narrowk32_2_w4_n4 = [&](auto t) -> bool {
+    using T = decltype(t);
+    if (smem_narrowk32_2stage > smem_limit) return false;
+    launch_typed_select_csq<T, 64, 32, 4, 2, 4>(x, centroids, x_sq, c_sq, cluster_ids,
+                                                B, N, K, D, stream, async_csq);
+    return true;
+  };
   auto try_launch_wide_3_w8 = [&](auto t) -> bool {
     using T = decltype(t);
     if (smem_wide_3stage > smem_limit) return false;
@@ -925,9 +979,11 @@ void launch_assign_sm80(const at::Tensor& x,
   // last-resort fallback before deep when SMEM is tight on unusual shapes.
   bool prefer_w8 = (K >= 128);
 
-  // Persistent N-tile knob. Default is auto: N_TILES=2 for most shapes, and
-  // N_TILES=4 for the D=128/K>=8192 mega bucket where longer persistent CTAs
-  // reduce end-to-end time. Override with FKC_NTILES={1,2,4} to re-A/B.
+  // Persistent N-tile knob. Default is auto: D=128 now prefers N_TILES=1
+  // because the inter-tile drain costs more than the amortized prologue after
+  // raw-distance epilogue cleanup. Other D-specialized paths keep N_TILES=2
+  // because it wins for the narrow BK32 large-D fallback. Override with
+  // FKC_NTILES={1,2,4} to re-A/B.
   static const int n_tiles_env = []() {
     const char* s = std::getenv("FKC_NTILES");
     if (!s) return 0;
@@ -939,7 +995,7 @@ void launch_assign_sm80(const at::Tensor& x,
   }();
   const int n_tiles_choice = (n_tiles_env != 0)
       ? n_tiles_env
-      : ((D == 128 && K >= 8192) ? 4 : 2);
+      : ((D == 128) ? 1 : 2);
 
   // 3-stage wide tile experiment knob. FKC_WIDE3=1 forces BN=128 BK=64 8w
   // 3-stage instead of the BK=128/96 2-stage default. Smaller BK fits a
@@ -976,7 +1032,9 @@ void launch_assign_sm80(const at::Tensor& x,
       using T = decltype(t);
       if (prefer_w8) {
         if (force_narrow_env) {
-          if (n_tiles_env >= 2) {
+          if (n_tiles_env == 4) {
+            if (try_launch_narrowk32_2_w4_n4(t)) return true;
+          } else if (n_tiles_env >= 2) {
             if (try_launch_narrowk32_2_w4_n2(t)) return true;
           }
           if (try_launch_narrowk32_2_w4(t)) return true;
@@ -998,6 +1056,8 @@ void launch_assign_sm80(const at::Tensor& x,
         // N-atoms × 2 acc regs + 14 B regs / thread tipped past nvcc's
         // sweet spot. Reverted; left history in commit.
         if (n_tiles_choice == 2) {
+          if (try_launch_widek128_2_w8_n2_d64(t)) return true;
+          if (try_launch_widek128_2_w8_n2_d96(t)) return true;
           if (try_launch_widek128_2_w8_n2(t)) return true;
           if (try_launch_widek96_2_w8_n2_d128(t)) return true;
           if (try_launch_widek96_2_w8_n2(t))  return true;
@@ -1012,11 +1072,27 @@ void launch_assign_sm80(const at::Tensor& x,
                try_launch_wide_3_w8(t) ||
                try_launch_wide_3_w4(t) ||
                try_launch_wide_2_w4(t) ||
+               (n_tiles_choice == 4 && try_launch_narrowk32_2_w4_n4(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d192(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d224(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d256(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d320(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d384(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2(t)) ||
+               try_launch_narrowk32_2_w4(t) ||
                try_launch_narrow_4(t) ||
                try_launch_deep_2_w4(t);
       } else {
         return try_launch_wide_3_w4(t) ||
                try_launch_wide_2_w4(t) ||
+               (n_tiles_choice == 4 && try_launch_narrowk32_2_w4_n4(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d192(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d224(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d256(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d320(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2_d384(t)) ||
+               (n_tiles_choice == 2 && try_launch_narrowk32_2_w4_n2(t)) ||
+               try_launch_narrowk32_2_w4(t) ||
                try_launch_narrow_4(t) ||
                try_launch_deep_2_w4(t);
       }
