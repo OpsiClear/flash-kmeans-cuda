@@ -25,6 +25,18 @@ def _set_ntiles(ntiles: str):
     os.environ["FKC_NTILES"] = ntiles
 
 
+@pytest.fixture(autouse=True)
+def _clean_fkc_ntiles():
+    """Restore FKC_NTILES to its original state after each test to prevent
+    env var leakage from polluting subprocess-based tests (e.g. test_assign_autotune)."""
+    original = os.environ.get("FKC_NTILES")
+    yield
+    if original is None:
+        os.environ.pop("FKC_NTILES", None)
+    else:
+        os.environ["FKC_NTILES"] = original
+
+
 @pytest.mark.parametrize("ntiles", ["1", "2", "4"])
 def test_identity_centroids(ntiles):
     """First K rows of x as centroids -> argmin trivially picks row index."""
