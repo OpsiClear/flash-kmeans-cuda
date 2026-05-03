@@ -1,5 +1,6 @@
 results.tsv
 .autotune/
+.triton_cache/
 build-shared/
 __pycache__/
 *.py[cod]
