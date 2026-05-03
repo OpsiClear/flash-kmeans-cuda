@@ -10,9 +10,10 @@ extension's source list and pass nanobind's include dir. A custom
 ship one for torch tensors.
 
 Per-architecture isolation:
-- ``assign/assign_sm80.cu`` (experimental mma path) compiles for sm_80, sm_86, sm_89.
-- ``assign/assign_sm90.cu`` (added in Phase B) compiles for sm_90a only.
-- ``assign/assign_safe.cu`` and the update kernels compile for every targeted arch.
+- ``assign/assign_sm80.cu`` (mma path) compiles for sm_80, sm_86, sm_89,
+  sm_90, sm_100, and sm_120 when supported by the installed CUDA toolkit.
+- ``assign/assign_safe.cu`` and the update kernels compile for every targeted
+  arch.
 
 We list ``-gencode arch=compute_XX,code=sm_XX`` for every supported arch so the
 resulting wheel is portable. ``-arch=native`` is intentionally NOT used.
@@ -50,11 +51,7 @@ if not NB_ROBIN_INCLUDE.exists():
 
 
 def _gencode_flags() -> list[str]:
-    """Per-architecture flags for the broad-arch sources.
-
-    Phase A targets: sm_80, sm_86, sm_89, sm_90, sm_100, sm_120.
-    sm_90a (Hopper wgmma) is added in Phase B with a separately compiled .cu.
-    """
+    """Per-architecture flags for the broad-arch sources."""
     archs = ["80", "86", "89", "90", "100", "120"]
     # Only emit gencode flags for archs the installed nvcc actually understands.
     # Unknown ones are filtered at compile time by setting TORCH_CUDA_ARCH_LIST

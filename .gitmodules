@@ -1,0 +1,4 @@
+[submodule "third_party/flash-kmeans"]
+	path = third_party/flash-kmeans
+	url = https://github.com/svg-project/flash-kmeans.git
+	ignore = untracked

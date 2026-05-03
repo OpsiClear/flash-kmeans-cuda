@@ -1,8 +1,30 @@
+# Local benchmark/tuning output
 results.tsv
 .autotune/
 .triton_cache/
-build-shared/
+*.log
+
+# Python/build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.venv/
+build/
+dist/
+*.egg
+
+# Native extension and CMake artifacts
+build-shared/
+*.pyd
+*.so
+*.dylib
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.pdb
+
+# Scratch directories
+.tmp/

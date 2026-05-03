@@ -119,9 +119,15 @@ Requirements used for the current Windows development environment:
 From a fresh checkout:
 
 ```powershell
-git clone https://github.com/OpsiClear/flash-kmeans-cuda.git
+git clone --recursive https://github.com/OpsiClear/flash-kmeans-cuda.git
 cd flash-kmeans-cuda
 uv sync --locked --python 3.12
+```
+
+For an existing checkout, initialize the reference implementation submodule:
+
+```powershell
+git submodule update --init --recursive
 ```
 
 Build the Python extension on Windows:

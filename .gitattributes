@@ -1,0 +1,15 @@
+* text=auto
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.pyd binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.lib binary
+*.exp binary
+*.obj binary
+*.o binary
+*.pdb binary
+*.cubin binary
