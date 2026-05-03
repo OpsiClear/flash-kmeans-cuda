@@ -49,6 +49,7 @@
 // assign_policy.cu (a separate TU) can instantiate its function pointers.
 #include "assign_sm80_kernel.cuh"
 #include "assign_policy.h"
+#include "assign_autotune.h"
 #include "../common/torch_cuda_includes.h"
 
 namespace fkc {
@@ -105,10 +106,16 @@ void launch_assign_sm80(const at::Tensor& x,
   int dtype_idx = dtype_index_of(x.scalar_type());
   TORCH_CHECK(dtype_idx >= 0, "assign_sm80 requires fp16 or bf16 input");
 
-  VariantView candidates = knobs.has_force_override()
-      ? build_forced_candidates(knobs, ctx)
-      : static_policy(dtype_idx, d_index_of(D), k_bucket_of(K),
-                      knobs.n_tiles_override);
+  VariantView candidates{nullptr, 0};
+  if (knobs.has_force_override()) {
+    candidates = build_forced_candidates(knobs, ctx);
+  } else {
+    AutotuneKey key{ dtype_idx, d_index_of(D), k_bucket_of(K) };
+    candidates = autotune_cache().get_or_probe(
+        key, ctx,
+        static_policy(dtype_idx, key.d_idx, key.k_bucket, knobs.n_tiles_override),
+        knobs.autotune, knobs.verbose);
+  }
 
   bool launched = false;
   bool is_fp16 = (x.scalar_type() == at::kHalf);
