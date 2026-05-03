@@ -2,7 +2,7 @@
 #pragma once
 
 // Variant factory: each kernel shape (BN, BK, WARPS, STAGES, N_TILES, D_FIXED,
-// RAW) is wrapped in a VariantSpec template. make_variant<…> produces a
+// RAW, KMIN) is wrapped in a VariantSpec template. make_variant<…> produces a
 // constexpr Variant struct holding name + dtype-erased function pointers, so
 // the policy table and autotuner can hold catalog entries by const Variant*.
 
@@ -29,7 +29,7 @@ struct LaunchCtx {
   cudaStream_t stream;
 };
 
-template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false>
+template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false, int KMin = 0>
 struct VariantSpec {
   static size_t smem(int D, size_t elt) {
     return compute_smem_bytes(BN, BK, D, S, elt);
@@ -39,6 +39,9 @@ struct VariantSpec {
   static bool try_launch(LaunchCtx& c) {
     if constexpr (DFix != 0) {
       if (c.D != DFix) return false;
+    }
+    if constexpr (KMin > 0) {
+      if (c.K < KMin) return false;
     }
     if (smem(c.D, c.elt_sz) > c.smem_limit) return false;
     launch_typed_select_csq<T, BN, BK, W, S, NT, DFix, Raw>(
@@ -55,9 +58,9 @@ struct Variant {
   size_t (*smem)(int D, size_t elt);
 };
 
-template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false>
+template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false, int KMin = 0>
 constexpr Variant make_variant(const char* name) {
-  using Spec = VariantSpec<BN, BK, W, S, NT, DFix, Raw>;
+  using Spec = VariantSpec<BN, BK, W, S, NT, DFix, Raw, KMin>;
   return Variant{
     name,
     &Spec::template try_launch<__half>,

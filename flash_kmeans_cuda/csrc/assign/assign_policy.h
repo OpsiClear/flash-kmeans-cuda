@@ -75,7 +75,7 @@ constexpr int k_bucket_of(int K) {
 // candidates have the trailing slots set to nullptr.
 using PolicyRow = std::array<const Variant*, MAX_CAND>;
 
-VariantView static_policy(int dtype_idx, int d_idx, int k_bucket);
+VariantView static_policy(int dtype_idx, int d_idx, int k_bucket, int n_tiles_override = 0);
 
 // === Per-call env knobs ======================================================
 

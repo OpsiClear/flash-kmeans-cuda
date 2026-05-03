@@ -31,11 +31,11 @@ constexpr Variant V_WIDEK128_W8_N4_D128 = make_variant<128, 128, 8, 2, 4, 128, t
 
 // Wide tiles, BLOCK_N=128, BLOCK_K=96.
 constexpr Variant V_WIDEK96_W8          = make_variant<128,  96, 8, 2, 1>("widek96_w8");
-constexpr Variant V_WIDEK96_W8_D128     = make_variant<128,  96, 8, 2, 1, 128, true>("widek96_w8_d128");
+constexpr Variant V_WIDEK96_W8_D128     = make_variant<128,  96, 8, 2, 1, 128, true, 256>("widek96_w8_d128");
 constexpr Variant V_WIDEK96_W8_N2       = make_variant<128,  96, 8, 2, 2>("widek96_w8_n2");
-constexpr Variant V_WIDEK96_W8_N2_D128  = make_variant<128,  96, 8, 2, 2, 128, true>("widek96_w8_n2_d128");
+constexpr Variant V_WIDEK96_W8_N2_D128  = make_variant<128,  96, 8, 2, 2, 128, true, 256>("widek96_w8_n2_d128");
 constexpr Variant V_WIDEK96_W8_N4       = make_variant<128,  96, 8, 2, 4>("widek96_w8_n4");
-constexpr Variant V_WIDEK96_W8_N4_D128  = make_variant<128,  96, 8, 2, 4, 128, true>("widek96_w8_n4_d128");
+constexpr Variant V_WIDEK96_W8_N4_D128  = make_variant<128,  96, 8, 2, 4, 128, true, 256>("widek96_w8_n4_d128");
 
 // 3-stage wide tiles.
 constexpr Variant V_WIDE_3_W8           = make_variant<128,  64, 8, 3, 1>("wide_3_w8");
@@ -123,14 +123,62 @@ constexpr PolicyRow kD384 = {
 // Per-D rows are duplicated across all K-buckets in Stage 1 (single static
 // order, the same as today's if/else, which only switches on K via the
 // prefer_w8 boolean — captured implicitly by ordering w8 variants first).
-constexpr PolicyRow kRows[N_D_IDX] = {
+// kRowsN2 is the n_tiles_choice==2 default path (matches the legacy default).
+constexpr PolicyRow kRowsN2[N_D_IDX] = {
   kD64, kD96, kD128, kD192, kD224, kD256, kD320, kD384, kGenericFallback,
 };
 
-VariantView static_policy(int /*dtype_idx*/, int d_idx, int /*k_bucket*/) {
+// =========================================================================
+// N_TILES=1 rows — transcribed from legacy n_tiles_choice==1 chain.
+// =========================================================================
+
+constexpr PolicyRow kD128_N1 = {
+  &V_WIDEK128_W8_D128, &V_WIDEK128_W8, &V_WIDEK96_W8_D128,
+  &V_WIDEK96_W8, &V_WIDE_3_W8, &V_WIDE_3_W4,
+  &V_NARROW_4, &V_DEEP_2_W4,
+};
+constexpr PolicyRow kGeneric_N1 = {
+  &V_WIDEK128_W8, &V_WIDEK96_W8, &V_WIDE_3_W8,
+  &V_WIDE_3_W4, &V_WIDE_2_W4, &V_NARROWK32_W4,
+  &V_NARROW_4, &V_DEEP_2_W4,
+};
+
+constexpr PolicyRow kRowsN1[N_D_IDX] = {
+  kGeneric_N1, kGeneric_N1, kD128_N1, kGeneric_N1, kGeneric_N1,
+  kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
+};
+
+// =========================================================================
+// N_TILES=4 rows — transcribed from legacy n_tiles_choice==4 branch.
+// =========================================================================
+
+constexpr PolicyRow kD128_N4 = {
+  &V_WIDEK128_W8_N4_D128, &V_WIDEK128_W8_N4, &V_WIDEK96_W8_N4_D128,
+  &V_WIDEK96_W8_N4, &V_NARROWK32_W4_N4, &V_NARROWK32_W4,
+  &V_NARROW_4, &V_DEEP_2_W4,
+};
+constexpr PolicyRow kGeneric_N4 = {
+  &V_WIDEK128_W8_N4, &V_WIDEK96_W8_N4, &V_NARROWK32_W4_N4,
+  &V_NARROWK32_W4, &V_NARROW_4, &V_DEEP_2_W4,
+  nullptr, nullptr,
+};
+
+constexpr PolicyRow kRowsN4[N_D_IDX] = {
+  kGeneric_N4, kGeneric_N4, kD128_N4, kGeneric_N4, kGeneric_N4,
+  kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
+};
+
+VariantView static_policy(int /*dtype_idx*/, int d_idx, int /*k_bucket*/, int n_tiles_override) {
   // Stage 1: identical row regardless of dtype or k_bucket. Stage 3's
   // autotuner reorders within each (dtype,K) cell at runtime.
-  return VariantView(kRows[d_idx].data(), MAX_CAND);
+  // n_tiles_override selects the per-N_TILES row table; 0 uses the N2 default.
+  const PolicyRow* row;
+  switch (n_tiles_override) {
+    case 1:  row = &kRowsN1[d_idx]; break;
+    case 4:  row = &kRowsN4[d_idx]; break;
+    default: row = &kRowsN2[d_idx]; break;
+  }
+  return VariantView(row->data(), MAX_CAND);
 }
 
 // =========================================================================
@@ -157,6 +205,12 @@ VariantView build_forced_candidates(const EnvKnobs& knobs, const LaunchCtx& ctx)
     if (knobs.n_tiles_override >= 2) return VariantView(kForcedNarrowN2.data(), MAX_CAND);
     return VariantView(kForcedNarrow.data(), MAX_CAND);
   }
+  // NOTE: legacy code, after these forced-shape branches exhausted their
+  // candidates on SMEM-too-tight, fell through to the auto-pick chain. The
+  // new dispatcher does not — if the forced shape doesn't fit, control
+  // falls all the way through to launch_assign_safe. This is the right
+  // semantics for an explicit user override; flagged here in case Task 5's
+  // equivalence test surfaces a SMEM-tight scenario.
   if (knobs.w4) {
     return VariantView(kForcedW4.data(), MAX_CAND);
   }
@@ -164,11 +218,12 @@ VariantView build_forced_candidates(const EnvKnobs& knobs, const LaunchCtx& ctx)
     if (knobs.n_tiles_override >= 2) return VariantView(kForcedWide3N2.data(), MAX_CAND);
     return VariantView(kForcedWide3.data(), MAX_CAND);
   }
-  // n_tiles_override on its own: just return the static policy row for the
-  // current D and let the dispatch loop pick the first that fits. The legacy
-  // code allowed FKC_NTILES alone to bias auto-selection but didn't force a
-  // specific shape, so this preserves that behaviour.
-  return static_policy(/*dtype_idx*/0, d_index_of(ctx.D), k_bucket_of(ctx.K));
+  // n_tiles_override on its own: return the per-N_TILES static policy row for
+  // the current D and let the dispatch loop pick the first that fits. The
+  // legacy code's three separate dispatch tables per n_tiles_choice are
+  // preserved via kRowsN1/kRowsN2/kRowsN4.
+  return static_policy(/*dtype_idx*/0, d_index_of(ctx.D), k_bucket_of(ctx.K),
+                       knobs.n_tiles_override);
 }
 
 // =========================================================================
