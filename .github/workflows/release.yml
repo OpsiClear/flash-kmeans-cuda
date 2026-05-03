@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish when running manually, for example v0.1.0"
+        required: false
+        type: string
+      publish:
+        description: "Create or update the GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  CUDA_REPO_VERSION: "13-0"
+  CUDA_HOME: "/usr/local/cuda-13.0"
+  TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0"
+  CMAKE_CUDA_ARCHITECTURES: "80;86;89;90"
+
+jobs:
+  source-dist:
+    name: Source distribution
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build frontend
+        run: python -m pip install --upgrade pip uv
+
+      - name: Install build dependencies
+        run: |
+          uv sync --locked --no-install-project
+          uv pip install --upgrade "setuptools>=77" wheel
+
+      - name: Build sdist
+        run: uv run --no-sync python setup.py sdist --formats=gztar
+
+      - name: Check sdist for generated artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$(tar -tzf dist/*.tar.gz | grep -E '(__pycache__|\.pyc$|\.pyo$|\.log$|\.pyd$|\.so$|\.dylib$|\.dll$|\.lib$|\.exp$|\.obj$|\.o$|\.pdb$|\.triton_cache|\.autotune|build-shared)' || true)"
+          if [[ -n "$bad" ]]; then
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  linux-binaries:
+    name: Linux CUDA wheel and shared library
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CUDA toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates wget gnupg build-essential
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_REPO_VERSION}"
+          echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync --locked --no-install-project
+          uv pip install --upgrade "setuptools>=77" wheel cmake ninja
+
+      - name: Build Python wheel
+        run: uv run --no-sync python setup.py bdist_wheel
+
+      - name: Build C++ shared library package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(uv run --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          torch_prefix="$(uv run --no-sync python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+
+          uv run --no-sync cmake -S . -B build-shared -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${torch_prefix}" \
+            -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}"
+          uv run --no-sync cmake --build build-shared --target flash_kmeans_cuda --parallel 2
+          uv run --no-sync cmake --install build-shared --prefix build-shared/install
+
+          tar -C build-shared/install -czf \
+            "dist/flash_kmeans_cuda-${version}-linux-x86_64-torch2.11-cu130-sm80_86_89_90-shared.tar.gz" .
+
+      - name: Upload Linux binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda-artifacts
+          path: |
+            dist/*.whl
+            dist/*-shared.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-22.04
+    needs:
+      - source-dist
+      - linux-binaries
+    if: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Resolve release tag
+        id: release-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          if [[ -z "${tag}" ]]; then
+            echo "A manual published release requires the tag input, for example v0.1.0." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find release-artifacts -type f | sort)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No release artifacts found." >&2
+            exit 1
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${files[@]}" \
+              --title "${RELEASE_TAG}" \
+              --generate-notes
+          fi

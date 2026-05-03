@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Development Notes
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file captures maintainer and agent notes for working on this repository.
 
 ## Repository layout
 
@@ -13,7 +13,8 @@ Cosine, Dot, and `kmeans_largeN` are intentionally not in the CUDA port — call
 
 ## Python environment
 
-The user's global instruction is: **always use `uv run` for Python**. Don't invoke `python` / `pip` directly — run `uv run python ...`, `uv run pip install ...`, etc.
+Use `uv run` for Python commands in this repository so the locked CUDA/PyTorch
+environment is active: `uv run python ...`, `uv run pip install ...`, etc.
 
 The CUDA port pins **torch 2.11.\*** built against **CUDA 13.0**, and **Python 3.12** (`requires-python = ">=3.12,<3.13"`). The cu130 wheel index is wired up in `pyproject.toml`:
 
@@ -37,7 +38,8 @@ Triton (used only by the upstream reference) is required for the fast path of `t
 
 For the CUDA port (run from repo root). The Windows build is finicky and
 requires the MSVC dev environment plus a few PATH tweaks — see the
-`build_vc.bat` recipe below. On Linux just `uv sync` and `uv run pytest`.
+helper scripts under `scripts/windows/`. On Linux just `uv sync` and
+`uv run pytest`.
 
 **Windows build recipe** (write to a `.bat` file and run via `cmd //c`):
 
@@ -48,7 +50,6 @@ set "PATH=%PATH:C:\Program Files\Git\usr\bin;=%"
 set "PATH=%PATH:C:\Program Files\Git\mingw64\bin;=%"
 set "PATH=%PATH:C:\Program Files\Git\usr\local\bin;=%"
 set DISTUTILS_USE_SDK=1
-cd /d C:\Users\HEQ\Projects\flash-kmeans-cuda
 uv sync                                                  & rem first build
 uv pip install -e . --no-build-isolation --reinstall-package flash-kmeans-cuda  & rem rebuild after kernel edits
 uv run python -m pytest tests/

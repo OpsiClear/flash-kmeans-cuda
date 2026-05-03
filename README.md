@@ -41,6 +41,16 @@ deltas were within about `+/-0.03%` on the large fp16 shapes.
 
 The implementation has three layers.
 
+## Repository Layout
+
+- `flash_kmeans_cuda/`: Python package and CUDA/C++ sources.
+- `benchmarks/`: assign, end-to-end, and quality comparison scripts.
+- `tests/`: CUDA correctness and shape coverage.
+- `scripts/windows/`: local Windows build, benchmark, and profiling helpers.
+- `docs/`: C++ shared-library and maintainer notes.
+- `cmake/`: CMake package config template.
+- `third_party/flash-kmeans`: upstream Triton reference submodule.
+
 ### Python Driver
 
 `flash_kmeans_cuda/kmeans.py` provides:
@@ -133,7 +143,7 @@ git submodule update --init --recursive
 Build the Python extension on Windows:
 
 ```powershell
-cmd /c run_exp_t.bat
+cmd /c scripts\windows\run_exp_t.bat
 ```
 
 Run tests:
@@ -214,7 +224,7 @@ uv run python benchmarks/bench_vs_triton.py --batch-size 1 --num-points 524288 -
 Quality comparison over several iterations:
 
 ```powershell
-uv run python .autotune\quality_compare.py --shapes med big huge mega --iters 10 --dtype fp16 --sample-points 4096
+uv run python benchmarks\quality_compare.py --shapes med big huge mega --iters 10 --dtype fp16 --sample-points 4096
 ```
 
 Available benchmark shapes in the local scripts:
@@ -225,6 +235,30 @@ Available benchmark shapes in the local scripts:
 | `big` | `(1, 131072, 2048, 128)` |
 | `huge` | `(1, 262144, 4096, 128)` |
 | `mega` | `(1, 524288, 8192, 128)` |
+
+## Release Automation
+
+GitHub Actions builds release artifacts when a `v*` tag is pushed:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds:
+
+- Python source distribution
+- Linux Python wheel for Python 3.12, Torch 2.11, CUDA 13.0
+- Linux C++ shared-library package for Torch 2.11, CUDA 13.0, `sm80/86/89/90`
+
+It then creates or updates the matching GitHub Release using `gh` and the
+repository `GITHUB_TOKEN`.
+
+Manual rebuild/publish:
+
+```powershell
+gh workflow run release.yml -f tag=v0.1.0 -f publish=true
+```
 
 ## Debug and Tuning Flags
 
