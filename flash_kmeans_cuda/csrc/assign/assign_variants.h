@@ -8,6 +8,7 @@
 
 #include "assign_kernel_launch.h"
 
+#include <ATen/core/Tensor.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstddef>
