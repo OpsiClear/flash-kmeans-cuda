@@ -91,6 +91,26 @@ constexpr Variant V_DSLAB_W8_N2_D256 =
 constexpr Variant V_DSLAB_W8_D256 =
     make_dslab_variant<128, 128, 8, 1, 1, 256, 128, 128, 0, 0>("dslab_w8_d256");
 
+constexpr Variant V_DSLAB_W8_N2_D192 =
+    make_dslab_variant<128, 128, 8, 1, 2, 192, 128, 64, 0, 0>("dslab_w8_n2_d192");
+constexpr Variant V_DSLAB_W8_D192 =
+    make_dslab_variant<128, 128, 8, 1, 1, 192, 128, 64, 0, 0>("dslab_w8_d192");
+
+constexpr Variant V_DSLAB_W8_N2_D224 =
+    make_dslab_variant<128, 128, 8, 1, 2, 224, 128, 96, 0, 0>("dslab_w8_n2_d224");
+constexpr Variant V_DSLAB_W8_D224 =
+    make_dslab_variant<128, 128, 8, 1, 1, 224, 128, 96, 0, 0>("dslab_w8_d224");
+
+constexpr Variant V_DSLAB_W8_N2_D320 =
+    make_dslab_variant<128, 128, 8, 1, 2, 320, 128, 128, 64, 0>("dslab_w8_n2_d320");
+constexpr Variant V_DSLAB_W8_D320 =
+    make_dslab_variant<128, 128, 8, 1, 1, 320, 128, 128, 64, 0>("dslab_w8_d320");
+
+constexpr Variant V_DSLAB_W8_N2_D384 =
+    make_dslab_variant<128, 128, 8, 1, 2, 384, 128, 128, 128, 0>("dslab_w8_n2_d384");
+constexpr Variant V_DSLAB_W8_D384 =
+    make_dslab_variant<128, 128, 8, 1, 1, 384, 128, 128, 128, 0>("dslab_w8_d384");
+
 // =========================================================================
 // Generic-D fallback chain. Used by every cell as the tail of its candidate
 // list, and as the entire row for OTHER_D_IDX.
@@ -230,21 +250,36 @@ constexpr PolicyRow kForcedWide3   = { &V_WIDE_3_W8, nullptr, nullptr, nullptr, 
 constexpr PolicyRow kForcedDslabD256 = {
   &V_DSLAB_W8_N2_D256, &V_DSLAB_W8_D256, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 };
+constexpr PolicyRow kForcedDslabD192 = {
+  &V_DSLAB_W8_N2_D192, &V_DSLAB_W8_D192, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+constexpr PolicyRow kForcedDslabD224 = {
+  &V_DSLAB_W8_N2_D224, &V_DSLAB_W8_D224, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+constexpr PolicyRow kForcedDslabD320 = {
+  &V_DSLAB_W8_N2_D320, &V_DSLAB_W8_D320, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+constexpr PolicyRow kForcedDslabD384 = {
+  &V_DSLAB_W8_N2_D384, &V_DSLAB_W8_D384, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
 }  // namespace
 
 VariantView build_forced_candidates(const EnvKnobs& knobs, const LaunchCtx& ctx) {
   // Precedence: dslab > deep > narrow > w4 > wide3. dslab is a developer
   // override knob added in Task 3 and should win over older shape forces.
   if (knobs.dslab) {
-    // Per-D dslab force-row. For Task 3, only D=256 is wired; later tasks
-    // add D=192/224/320/384.
-    if (ctx.D == 256) {
-      return VariantView(kForcedDslabD256.data(), MAX_CAND);
+    switch (ctx.D) {
+      case 192: return VariantView(kForcedDslabD192.data(), MAX_CAND);
+      case 224: return VariantView(kForcedDslabD224.data(), MAX_CAND);
+      case 256: return VariantView(kForcedDslabD256.data(), MAX_CAND);
+      case 320: return VariantView(kForcedDslabD320.data(), MAX_CAND);
+      case 384: return VariantView(kForcedDslabD384.data(), MAX_CAND);
+      default: {
+        static constexpr PolicyRow kEmpty = {nullptr, nullptr, nullptr, nullptr,
+                                              nullptr, nullptr, nullptr, nullptr};
+        return VariantView(kEmpty.data(), MAX_CAND);
+      }
     }
-    // Unknown D for FKC_DSLAB — fall through to safe kernel via empty row.
-    static constexpr PolicyRow kEmpty = {nullptr, nullptr, nullptr, nullptr,
-                                          nullptr, nullptr, nullptr, nullptr};
-    return VariantView(kEmpty.data(), MAX_CAND);
   }
   if (knobs.deep) {
     return VariantView(kForcedDeep.data(), MAX_CAND);
