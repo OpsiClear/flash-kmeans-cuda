@@ -55,3 +55,29 @@ def test_dispatcher_matches_reference(B, N, K, D, dtype):
         f"D={D} K={K} dtype={dtype}: {disagree:.3%} disagreement vs python "
         f"reference (threshold {threshold:.0%} — tied-distance rounding only)"
     )
+
+
+@pytest.mark.parametrize(
+    "D",
+    [64, 96, 128, 192, 224, 256, 320, 384],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_all_locked_d_values_dispatch(D, dtype):
+    """Stage 2 acceptance: every D in the locked set produces correct
+    cluster_ids vs the python reference, for both dtypes and a mid-range K."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(0)
+    B, N, K = 1, 2048, 256
+    x = torch.randn(B, N, D, device="cuda", dtype=dtype)
+    centroids = x[:, :K].contiguous()
+    x_sq = (x.float() ** 2).sum(-1).contiguous()
+    c_sq = (centroids.float() ** 2).sum(-1).contiguous()
+    ids = _C.euclid_assign(x, centroids, x_sq, c_sq, None)
+    ref = _reference_assign(x, centroids)
+    threshold = 0.05 if dtype == torch.bfloat16 else 0.02
+    disagree = (ids != ref).float().mean().item()
+    assert disagree < threshold, (
+        f"D={D} dtype={dtype}: {disagree:.3%} disagreement vs reference "
+        f"(threshold {threshold:.0%} — tied-distance rounding only)"
+    )
