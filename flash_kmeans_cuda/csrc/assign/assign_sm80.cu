@@ -176,6 +176,12 @@ __device__ __forceinline__ void store_csq_tile(
 
 // assign_sm80_kernel is defined at fkc::assign scope (not anonymous) so that
 // the forward declaration in assign_kernel_launch.h can reference it.
+//
+// IMPORTANT: signature, __launch_bounds__, and the __restrict__ qualifiers on
+// every parameter must stay in sync with the forward declaration in
+// assign_kernel_launch.h. NVCC bakes __launch_bounds__ into the kernel symbol;
+// a mismatch causes cudaErrorInvalidDeviceFunction at runtime, not at link
+// time.
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
           int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0,
           bool RAW_DIST = false>
