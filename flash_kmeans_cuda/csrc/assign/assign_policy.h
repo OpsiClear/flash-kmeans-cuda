@@ -85,11 +85,12 @@ struct EnvKnobs {
   bool w4               = false; // FKC_W4
   bool narrow           = false; // FKC_NARROW
   bool deep             = false; // FKC_ASSIGN_DEEP_TILE
+  bool dslab            = false; // FKC_DSLAB — force-route to D-slab variant
   bool autotune         = true;  // FKC_AUTOTUNE (default on)
   bool verbose          = false; // FKC_AUTOTUNE_VERBOSE
 
   bool has_force_override() const {
-    return wide3 || w4 || narrow || deep || n_tiles_override != 0;
+    return wide3 || w4 || narrow || deep || dslab || n_tiles_override != 0;
   }
 };
 

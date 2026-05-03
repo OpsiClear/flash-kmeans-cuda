@@ -7,6 +7,8 @@
 // Kernel template definition needed to instantiate VariantSpec::try_launch<T>
 // function pointers. Must come before the constexpr Variant definitions below.
 #include "assign_sm80_kernel.cuh"
+#include "assign_dslab_variants.h"
+#include "assign_sm80_dslab_kernel.cuh"
 
 #include <array>
 #include <cstdlib>
@@ -80,6 +82,14 @@ constexpr Variant V_WIDE_3_W8_D256       = make_variant<128,  64, 8, 3, 1, 256, 
 constexpr Variant V_WIDE_3_W8_N2_D192    = make_variant<128,  64, 8, 3, 2, 192, true>("wide_3_w8_n2_d192");
 constexpr Variant V_WIDE_3_W8_N2_D224    = make_variant<128,  64, 8, 3, 2, 224, true>("wide_3_w8_n2_d224");
 constexpr Variant V_WIDE_3_W8_N2_D256    = make_variant<128,  64, 8, 3, 2, 256, true>("wide_3_w8_n2_d256");
+
+// === D-slab variants ======================================================
+// Per-D template instantiations with compile-time partition baked in.
+// SLAB_MAX = 128, max 4 slabs per partition (zero-padded for fewer).
+constexpr Variant V_DSLAB_W8_N2_D256 =
+    make_dslab_variant<128, 128, 8, 2, 2, 256, 128, 128, 0, 0>("dslab_w8_n2_d256");
+constexpr Variant V_DSLAB_W8_D256 =
+    make_dslab_variant<128, 128, 8, 2, 1, 256, 128, 128, 0, 0>("dslab_w8_d256");
 
 // =========================================================================
 // Generic-D fallback chain. Used by every cell as the tail of its candidate
@@ -217,10 +227,25 @@ constexpr PolicyRow kForcedNarrow  = { &V_NARROWK32_W4, nullptr, nullptr, nullpt
 constexpr PolicyRow kForcedW4      = { &V_WIDE_3_W4, &V_WIDE_2_W4, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 constexpr PolicyRow kForcedWide3N2 = { &V_WIDE_3_W8_N2, &V_WIDE_3_W8, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 constexpr PolicyRow kForcedWide3   = { &V_WIDE_3_W8, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+constexpr PolicyRow kForcedDslabD256 = {
+  &V_DSLAB_W8_N2_D256, &V_DSLAB_W8_D256, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
 }  // namespace
 
 VariantView build_forced_candidates(const EnvKnobs& knobs, const LaunchCtx& ctx) {
-  // Precedence mirrors today's force_*_env branches: deep > narrow > w4 > wide3.
+  // Precedence: dslab > deep > narrow > w4 > wide3. dslab is a developer
+  // override knob added in Task 3 and should win over older shape forces.
+  if (knobs.dslab) {
+    // Per-D dslab force-row. For Task 3, only D=256 is wired; later tasks
+    // add D=192/224/320/384.
+    if (ctx.D == 256) {
+      return VariantView(kForcedDslabD256.data(), MAX_CAND);
+    }
+    // Unknown D for FKC_DSLAB — fall through to safe kernel via empty row.
+    static constexpr PolicyRow kEmpty = {nullptr, nullptr, nullptr, nullptr,
+                                          nullptr, nullptr, nullptr, nullptr};
+    return VariantView(kEmpty.data(), MAX_CAND);
+  }
   if (knobs.deep) {
     return VariantView(kForcedDeep.data(), MAX_CAND);
   }
@@ -266,6 +291,7 @@ EnvKnobs read_env_knobs() {
   k.w4       = truthy(std::getenv("FKC_W4"));
   k.narrow   = truthy(std::getenv("FKC_NARROW"));
   k.deep     = truthy(std::getenv("FKC_ASSIGN_DEEP_TILE"));
+  k.dslab    = truthy(std::getenv("FKC_DSLAB"));
   // FKC_AUTOTUNE defaults to ON. Set FKC_AUTOTUNE=0 to disable.
   if (const char* s = std::getenv("FKC_AUTOTUNE")) {
     k.autotune = !(std::strcmp(s, "0") == 0 || std::strcmp(s, "false") == 0);
