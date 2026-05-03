@@ -46,8 +46,13 @@ template <int BN, int BK, int W, int S, int NT,
           bool Raw = true>
 struct DSlabVariantSpec {
   static size_t smem(int /*D*/, size_t elt) {
-    // D-independent: x_slab + STAGES * c_slab + STAGES * c_sq.
-    size_t row = (size_t)(SLAB_MAX + SMEM_PAD_SLAB);
+    // The kernel scaffold (Tasks 2-4) still uses D_FULL as its working
+    // dimension; Task 5 will restructure to one SLAB_MAX-wide slab at a
+    // time. While in scaffold mode, we must allocate enough SMEM for the
+    // legacy-style full-D layout, otherwise the kernel walks off the end
+    // of its allocation. Once Task 5 lands, swap D_FULL for SLAB_MAX here
+    // to realize the D-independent footprint.
+    size_t row = (size_t)(D_FULL + SMEM_PAD_SLAB);
     return BN * row * elt
          + (size_t)S * BK * row * elt
          + (size_t)S * BK * sizeof(float);
