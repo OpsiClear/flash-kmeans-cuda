@@ -238,6 +238,11 @@ Available benchmark shapes in the local scripts:
 
 ## Release Automation
 
+CI runs on pushes to `main` / `optimize/**`, on pull requests, and on manual
+dispatch. It checks Python packaging, scans source distributions for generated
+artifacts, and compiles both the Linux CUDA Python wheel and Linux C++ shared
+library package.
+
 GitHub Actions builds release artifacts when a `v*` tag is pushed:
 
 ```powershell
