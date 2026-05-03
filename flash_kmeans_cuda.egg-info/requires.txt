@@ -1,6 +1,0 @@
-torch==2.11.*
-nanobind>=2.1
-
-[dev]
-pytest
-flash-kmeans

@@ -1,3 +1,7 @@
 results.tsv
 .autotune/
 build-shared/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
