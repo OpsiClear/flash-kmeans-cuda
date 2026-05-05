@@ -95,6 +95,15 @@ constexpr Variant V_NARROWK32_S3_W4_N2_D256= make_variant< 64,  32, 4, 3, 2, 256
 constexpr Variant V_NARROWK32_S4_W4_N2_D192= make_variant< 64,  32, 4, 4, 2, 192, true>("narrowk32_s4_w4_n2_d192");
 constexpr Variant V_NARROWK32_S4_W4_N2_D224= make_variant< 64,  32, 4, 4, 2, 224, true>("narrowk32_s4_w4_n2_d224");
 
+// BN=128 W=8 narrow-BK probes for D=192/224. Doubles per-CTA rows vs the
+// BN=64 narrow family — more arithmetic intensity per launch. WARP_M=16
+// (BN/W=128/8) satisfies the kernel's 16-multiple constraint. SMEM:
+//   D=192 BK=32 S=2: 77 KB; D=224 BK=32 S=2: 89 KB. (D=256 = 102 KB, over.)
+constexpr Variant V_WIDEK32_W8_N2_D192= make_variant<128,  32, 8, 2, 2, 192, true>("widek32_w8_n2_d192");
+constexpr Variant V_WIDEK32_W8_N4_D192= make_variant<128,  32, 8, 2, 4, 192, true>("widek32_w8_n4_d192");
+constexpr Variant V_WIDEK32_W8_N2_D224= make_variant<128,  32, 8, 2, 2, 224, true>("widek32_w8_n2_d224");
+constexpr Variant V_WIDEK32_W8_N4_D224= make_variant<128,  32, 8, 2, 4, 224, true>("widek32_w8_n4_d224");
+
 // STAGES=1 wider-BK candidates for D=320/384 were tried (20-30% slower than
 // STAGES=2 BK=32) — async pipeline overlap matters more than bigger K-chunks
 // at large D. To break past the BK=32 cap at D=320/384 needs SMEM_PAD reduction
@@ -196,15 +205,15 @@ constexpr PolicyRow kD128 = {
 // stay reachable via FKC_NTILES={1,4} (kRowsN1/kRowsN4) and via FKC_NARROW
 // (kForcedNarrow*).
 constexpr PolicyRow kD192 = {
-  &V_NARROWK64_W4_N2_D192, &V_NARROWK48_S3_W4_N2_D192,
-  &V_NARROWK32_S4_W4_N2_D192, &V_NARROWK64_W4_N4_D192,
+  &V_WIDEK32_W8_N2_D192, &V_NARROWK64_W4_N2_D192,
+  &V_WIDEK32_W8_N4_D192, &V_NARROWK64_W4_N4_D192,
   &V_NARROWK48_W4_N2_D192, &V_NARROWK32_W4_N2_D192,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD224 = {
-  &V_NARROWK64_W4_N2_D224, &V_NARROWK48_S3_W4_N2_D224,
-  &V_NARROWK32_S4_W4_N2_D224, &V_NARROWK64_W4_N4_D224,
+  &V_WIDEK32_W8_N2_D224, &V_NARROWK64_W4_N2_D224,
+  &V_WIDEK32_W8_N4_D224, &V_NARROWK64_W4_N4_D224,
   &V_NARROWK48_W4_N2_D224, &V_NARROWK32_W4_N2_D224,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
