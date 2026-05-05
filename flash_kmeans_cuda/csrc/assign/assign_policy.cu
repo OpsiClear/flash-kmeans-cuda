@@ -73,6 +73,16 @@ constexpr Variant V_NARROWK48_W4_N2_D256= make_variant< 64,  48, 4, 2, 2, 256, t
 constexpr Variant V_NARROWK64_W4_N2_D192= make_variant< 64,  64, 4, 2, 2, 192, true>("narrowk64_w4_n2_d192");
 constexpr Variant V_NARROWK64_W4_N2_D224= make_variant< 64,  64, 4, 2, 2, 224, true>("narrowk64_w4_n2_d224");
 
+// NT=4 D-specialized companions: same shape as the BK winner per D, just
+// persistent across 4 BLOCK_N tiles per CTA. Halves launch count vs NT=2;
+// the autotuner picks per (D, K_bucket) cell. Same SMEM as NT=2 (NT only
+// affects the n_tile loop count, not the per-CTA tile size).
+constexpr Variant V_NARROWK64_W4_N4_D192= make_variant< 64,  64, 4, 2, 4, 192, true>("narrowk64_w4_n4_d192");
+constexpr Variant V_NARROWK64_W4_N4_D224= make_variant< 64,  64, 4, 2, 4, 224, true>("narrowk64_w4_n4_d224");
+constexpr Variant V_NARROWK48_W4_N4_D256= make_variant< 64,  48, 4, 2, 4, 256, true>("narrowk48_w4_n4_d256");
+constexpr Variant V_NARROWK32_W4_N4_D320= make_variant< 64,  32, 4, 2, 4, 320, true>("narrowk32_w4_n4_d320");
+constexpr Variant V_NARROWK32_W4_N4_D384= make_variant< 64,  32, 4, 2, 4, 384, true>("narrowk32_w4_n4_d384");
+
 // Deep tile.
 constexpr Variant V_DEEP_2_W4           = make_variant< 64, 128, 4, 2, 1>("deep_2_w4");
 
@@ -168,36 +178,38 @@ constexpr PolicyRow kD128 = {
 // stay reachable via FKC_NTILES={1,4} (kRowsN1/kRowsN4) and via FKC_NARROW
 // (kForcedNarrow*).
 constexpr PolicyRow kD192 = {
-  &V_NARROWK64_W4_N2_D192, &V_NARROWK48_W4_N2_D192,
-  &V_NARROWK32_W4_N2_D192, &V_WIDEK96_W8_N2_D192,
-  &V_WIDEK96_W8_D192, &V_WIDE_3_W8_N2_D192,
+  &V_NARROWK64_W4_N2_D192, &V_NARROWK64_W4_N4_D192,
+  &V_NARROWK48_W4_N2_D192, &V_NARROWK32_W4_N2_D192,
+  &V_WIDEK96_W8_N2_D192, &V_WIDEK96_W8_D192,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD224 = {
-  &V_NARROWK64_W4_N2_D224, &V_NARROWK48_W4_N2_D224,
-  &V_NARROWK32_W4_N2_D224, &V_WIDEK96_W8_N2_D224,
-  &V_WIDEK96_W8_D224, &V_WIDE_3_W8_N2_D224,
+  &V_NARROWK64_W4_N2_D224, &V_NARROWK64_W4_N4_D224,
+  &V_NARROWK48_W4_N2_D224, &V_NARROWK32_W4_N2_D224,
+  &V_WIDEK96_W8_N2_D224, &V_WIDEK96_W8_D224,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD256 = {
-  &V_NARROWK48_W4_N2_D256, &V_NARROWK32_W4_N2_D256,
-  &V_WIDE_3_W8_N2_D256, &V_WIDE_3_W8_D256,
-  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
-  &V_NARROW_4, &V_DEEP_2_W4,
+  &V_NARROWK48_W4_N2_D256, &V_NARROWK48_W4_N4_D256,
+  &V_NARROWK32_W4_N2_D256, &V_WIDE_3_W8_N2_D256,
+  &V_WIDE_3_W8_D256, &V_NARROWK32_W4_N2,
+  &V_NARROWK32_W4, &V_DEEP_2_W4,
 };
 
 constexpr PolicyRow kD320 = {
-  &V_NARROWK32_W4_N2_D320, &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
+  &V_NARROWK32_W4_N2_D320, &V_NARROWK32_W4_N4_D320,
+  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
   &V_WIDE_3_W4, &V_NARROW_4, &V_DEEP_2_W4,
-  nullptr, nullptr,
+  nullptr,
 };
 
 constexpr PolicyRow kD384 = {
-  &V_NARROWK32_W4_N2_D384, &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
+  &V_NARROWK32_W4_N2_D384, &V_NARROWK32_W4_N4_D384,
+  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
   &V_WIDE_3_W4, &V_NARROW_4, &V_DEEP_2_W4,
-  nullptr, nullptr,
+  nullptr,
 };
 
 // Per-D rows are duplicated across all K-buckets in Stage 1 (single static
