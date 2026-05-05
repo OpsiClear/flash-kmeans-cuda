@@ -69,22 +69,33 @@ D=320 / D=384 are even tighter. Only BN=64 BK=32 STAGES=2 fits.
 
 ---
 
-## Three real next moves (in order of effort)
+## Real next moves (in order of viability after validation)
 
-### Move 1 — `mma.m16n8k32` (1-2 days, projected +5-10%)
+### Move 1 — D-slab kernel inter-slab pipelining (1-2 weeks, projected +20-30% at D ≥ 192) — **highest priority**
 
-Switch the inner mma instruction from m16n8k16 to m16n8k32. Doubles K per mma → halves d_step iterations. Same SMEM. Same accumulator shape (16×8 fp32 / 2 u32 fp16-acc).
+The dslab kernel scaffold (`flash_kmeans_cuda/csrc/assign/assign_sm80_dslab_kernel.cuh`) is already in place; the perf bug is `cp_async_wait_all()` between slabs killing overlap. Fix:
+
+- Allocate **2 SMEM stages** for both x_slab and c_slab (currently 1 each).
+- Replace `wait_all` with `cp_async_wait_group<1>` so slab N+1's load overlaps slab N's mma.
+- Drop BN to 64 OR BK to 64 to fit the doubled SMEM under 99 KB.
+
+At D=384 with BN=64 BK=64 STAGES=2 D-slab: ~97 KB, projected ≥190 TFLOPS. Spec at `docs/superpowers/specs/2026-05-03-assign-d-slab-tiling-design.md`; outcome notes at `docs/superpowers/specs/2026-05-03-assign-d-slab-tiling-results.md`.
+
+This is the single highest-leverage lever for D ∈ {192, 256, 320, 384} since it sidesteps the SMEM-cap wall entirely.
+
+### Move 2 — `mma.m16n8k32` (~1-2 days, projected +0-5%) — **lower-priority**
+
+Already analyzed in this session. Switching to m16n8k32 would halve the d_step iteration count but Ada's m16n8k32 throughput is 1 inst/4 clk vs 2× m16n8k16 = 2 inst × 2 clk = same cycle count. Doubling ldmatrix per d_step also cancels the inner-loop reduction. Win comes only from issue-rate slack and reduced static instruction count.
 
 **Files to touch:**
-- `flash_kmeans_cuda/csrc/common/ptx.cuh` — add `mma_m16n8k32_fp16_acc_fp16` helper alongside the existing `mma_m16n8k16_*` (lines 99-170). PTX form: `mma.sync.aligned.m16n8k32.row.col.f16.f16.f16.f16` with 8 A regs, 4 B regs, 2 D regs per thread.
-- `flash_kmeans_cuda/csrc/assign/assign_sm80_kernel.cuh` (line 318 d_step loop) — add a `int K_STEP=16` template parameter. When K_STEP=32, double the A/B reg loads and call the new mma helper. Preserve K_STEP=16 path for backwards compat.
-- `flash_kmeans_cuda/csrc/assign/assign_kernel_launch.h` — plumb K_STEP through `launch_typed` / `launch_typed_select_csq`.
-- `flash_kmeans_cuda/csrc/assign/assign_variants.h` — add K_STEP template param to `make_variant<>` / `VariantSpec`.
-- `flash_kmeans_cuda/csrc/assign/assign_policy.cu` — add K_STEP=32 catalog entries for D=192/224/256/320/384 NARROW family. Update relevant kD* rows.
+- `flash_kmeans_cuda/csrc/common/ptx.cuh` — add `mma_m16n8k32_fp16_acc_fp16` helper. PTX: `mma.sync.aligned.m16n8k32.row.col.f16.f16.f16.f16` with 8 A regs, 4 B regs, 2 D regs per thread.
+- `flash_kmeans_cuda/csrc/assign/assign_sm80_kernel.cuh` (line 318 d_step loop) — add a `int K_STEP=16` template parameter. When K_STEP=32, double the A/B reg loads and call the new mma helper.
+- Plumb K_STEP through `launch_typed` / `make_variant<>`.
+- Add K_STEP=32 catalog entries.
 
-**Risk:** ldmatrix.x4 layout changes — same instruction loads twice the K data, so the per-thread reg distribution shifts. Wrong layout = silent corruption.
+**Risk:** ldmatrix.x4 lane-to-source mapping changes when loading 32 K cols at once. Wrong layout = silent correctness break (caught by `test_assign_dispatch_equiv.py::test_all_locked_d_values_dispatch`).
 
-**How to verify correctness:** `tests/test_assign_dispatch_equiv.py::test_all_locked_d_values_dispatch` (already covers all 8 locked D × 2 dtypes; per-dtype thresholds 2% fp16 / 5% bf16 vs Python fp32 reference).
+Skip unless Move 1 underdelivers.
 
 ### Move 2 — D-slab kernel inter-slab pipelining (1-2 weeks, projected +20-30% at D ≥ 192)
 
