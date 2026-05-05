@@ -83,6 +83,24 @@ constexpr Variant V_NARROWK48_W4_N4_D256= make_variant< 64,  48, 4, 2, 4, 256, t
 constexpr Variant V_NARROWK32_W4_N4_D320= make_variant< 64,  32, 4, 2, 4, 320, true>("narrowk32_w4_n4_d320");
 constexpr Variant V_NARROWK32_W4_N4_D384= make_variant< 64,  32, 4, 2, 4, 384, true>("narrowk32_w4_n4_d384");
 
+// STAGES=3 deeper-pipeline candidates for D ∈ {192, 224, 256} where the
+// extra stage fits SMEM. Trades a c_smem stage against more cp.async overlap;
+// at large K the extra pipeline depth can hide the per-K-chunk drain cost.
+//   D=192 BK=48 S=3: 84 KB; BK=32 S=4: 77 KB
+//   D=224 BK=48 S=3: 97 KB; BK=32 S=4: 90 KB
+//   D=256 BK=32 S=3: 85 KB
+constexpr Variant V_NARROWK48_S3_W4_N2_D192= make_variant< 64,  48, 4, 3, 2, 192, true>("narrowk48_s3_w4_n2_d192");
+constexpr Variant V_NARROWK48_S3_W4_N2_D224= make_variant< 64,  48, 4, 3, 2, 224, true>("narrowk48_s3_w4_n2_d224");
+constexpr Variant V_NARROWK32_S3_W4_N2_D256= make_variant< 64,  32, 4, 3, 2, 256, true>("narrowk32_s3_w4_n2_d256");
+constexpr Variant V_NARROWK32_S4_W4_N2_D192= make_variant< 64,  32, 4, 4, 2, 192, true>("narrowk32_s4_w4_n2_d192");
+constexpr Variant V_NARROWK32_S4_W4_N2_D224= make_variant< 64,  32, 4, 4, 2, 224, true>("narrowk32_s4_w4_n2_d224");
+
+// STAGES=1 wider-BK candidates for D=320/384 were tried (20-30% slower than
+// STAGES=2 BK=32) — async pipeline overlap matters more than bigger K-chunks
+// at large D. To break past the BK=32 cap at D=320/384 needs SMEM_PAD reduction
+// or a new kernel shape (D-slab etc.), not catalog tweaks. Removed; left this
+// note so the next iteration doesn't repeat the experiment.
+
 // Deep tile.
 constexpr Variant V_DEEP_2_W4           = make_variant< 64, 128, 4, 2, 1>("deep_2_w4");
 
@@ -178,23 +196,23 @@ constexpr PolicyRow kD128 = {
 // stay reachable via FKC_NTILES={1,4} (kRowsN1/kRowsN4) and via FKC_NARROW
 // (kForcedNarrow*).
 constexpr PolicyRow kD192 = {
-  &V_NARROWK64_W4_N2_D192, &V_NARROWK64_W4_N4_D192,
+  &V_NARROWK64_W4_N2_D192, &V_NARROWK48_S3_W4_N2_D192,
+  &V_NARROWK32_S4_W4_N2_D192, &V_NARROWK64_W4_N4_D192,
   &V_NARROWK48_W4_N2_D192, &V_NARROWK32_W4_N2_D192,
-  &V_WIDEK96_W8_N2_D192, &V_WIDEK96_W8_D192,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD224 = {
-  &V_NARROWK64_W4_N2_D224, &V_NARROWK64_W4_N4_D224,
+  &V_NARROWK64_W4_N2_D224, &V_NARROWK48_S3_W4_N2_D224,
+  &V_NARROWK32_S4_W4_N2_D224, &V_NARROWK64_W4_N4_D224,
   &V_NARROWK48_W4_N2_D224, &V_NARROWK32_W4_N2_D224,
-  &V_WIDEK96_W8_N2_D224, &V_WIDEK96_W8_D224,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD256 = {
-  &V_NARROWK48_W4_N2_D256, &V_NARROWK48_W4_N4_D256,
-  &V_NARROWK32_W4_N2_D256, &V_WIDE_3_W8_N2_D256,
-  &V_WIDE_3_W8_D256, &V_NARROWK32_W4_N2,
+  &V_NARROWK48_W4_N4_D256, &V_NARROWK32_S3_W4_N2_D256,
+  &V_NARROWK48_W4_N2_D256, &V_NARROWK32_W4_N2_D256,
+  &V_WIDE_3_W8_N2_D256, &V_NARROWK32_W4_N2,
   &V_NARROWK32_W4, &V_DEEP_2_W4,
 };
 
@@ -206,7 +224,7 @@ constexpr PolicyRow kD320 = {
 };
 
 constexpr PolicyRow kD384 = {
-  &V_NARROWK32_W4_N2_D384, &V_NARROWK32_W4_N4_D384,
+  &V_NARROWK32_W4_N4_D384, &V_NARROWK32_W4_N2_D384,
   &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
   &V_WIDE_3_W4, &V_NARROW_4, &V_DEEP_2_W4,
   nullptr,
