@@ -6,21 +6,14 @@ REM This intentionally builds only for the local Ada target by default. Broad
 REM release builds can override TORCH_CUDA_ARCH_LIST before invoking this file.
 REM Compiling every CUDA 13.x arch is too slow for edit/measure loops and can
 REM stall nvcc on high arch front-end passes such as compute_120.
+REM
+REM MAX_JOBS=1: avoids nvcc OOM under cl.exe + ptxas memory pressure on
+REM Windows; raise to 4 if RAM permits.
 
-if not defined VS_VCVARS set "VS_VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-if not exist "%VS_VCVARS%" (
-  echo Missing Visual Studio vcvars64.bat. Set VS_VCVARS to its full path.
-  exit /b 1
-)
-
-call "%VS_VCVARS%" >nul 2>&1
-set "PATH=%PATH:C:\Program Files\Git\usr\bin;=%"
-set "PATH=%PATH:C:\Program Files\Git\mingw64\bin;=%"
-set "PATH=%PATH:C:\Program Files\Git\usr\local\bin;=%"
+call "%~dp0_setup_env.bat" || exit /b 1
 
 if not defined TORCH_CUDA_ARCH_LIST set "TORCH_CUDA_ARCH_LIST=8.9"
 if not defined MAX_JOBS set "MAX_JOBS=1"
-set "DISTUTILS_USE_SDK=1"
 
 pushd "%~dp0\..\.." || exit /b 1
 if not exist .autotune mkdir .autotune

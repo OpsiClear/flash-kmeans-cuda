@@ -56,10 +56,17 @@ constexpr Variant V_NARROWK32_W4_N2_D320= make_variant< 64,  32, 4, 2, 2, 320, t
 constexpr Variant V_NARROWK32_W4_N2_D384= make_variant< 64,  32, 4, 2, 2, 384, true>("narrowk32_w4_n2_d384");
 constexpr Variant V_NARROWK32_W4_N4     = make_variant< 64,  32, 4, 2, 4>("narrowk32_w4_n4");
 
-// Narrow-family probes for large D / mega K. BK=32 is the current winner
-// because it fits the Ada SMEM cap at every target D. BK=48 fits through
-// D=256; BK=64 fits through D=224. Both keep the same BN=64/W4/STAGES=2/N2
-// shape and only widen the K chunk.
+// Wider-K narrow probes for large D / mega K. BK=32 was the prior winner
+// because it always fits the Ada SMEM cap; BK=48 and BK=64 widen the K-chunk
+// (more arithmetic per cp.async batch) and are added as autotuner candidates
+// to challenge BK=32 at large D. Same BN=64/W4/STAGES=2/N2 shape as
+// V_NARROWK32_W4_N2_D*; only BK changes.
+//
+// SMEM fit (BN*(D+8)*elt + STAGES*BK*(D+8)*elt + STAGES*BK*4, fp16, Ada cap
+// ~99 KB):
+//   BK=48: D=192 63 KB, D=224 73 KB, D=256 83 KB — all fit.
+//   BK=64: D=192 76 KB, D=224 88 KB, D=256 99.5 KB — D=256 over by 512 B,
+//          so V_NARROWK64_W4_N2_D256 is intentionally NOT instantiated.
 constexpr Variant V_NARROWK48_W4_N2_D192= make_variant< 64,  48, 4, 2, 2, 192, true>("narrowk48_w4_n2_d192");
 constexpr Variant V_NARROWK48_W4_N2_D224= make_variant< 64,  48, 4, 2, 2, 224, true>("narrowk48_w4_n2_d224");
 constexpr Variant V_NARROWK48_W4_N2_D256= make_variant< 64,  48, 4, 2, 2, 256, true>("narrowk48_w4_n2_d256");
@@ -154,6 +161,12 @@ constexpr PolicyRow kD128 = {
   &V_WIDE_3_W8, &V_NARROW_4,
 };
 
+// kD192/kD224/kD256: rows are MAX_CAND=8. Wider-K narrow probes
+// (NARROWK64/48) lead so the autotuner can challenge the prior NARROWK32
+// winner. Trailing slots traded V_NARROW_4 (and V_WIDE_3_W8_D192/D224 /
+// V_WIDE_3_W4 for D=256) for the new candidates — the dropped variants
+// stay reachable via FKC_NTILES={1,4} (kRowsN1/kRowsN4) and via FKC_NARROW
+// (kForcedNarrow*).
 constexpr PolicyRow kD192 = {
   &V_NARROWK64_W4_N2_D192, &V_NARROWK48_W4_N2_D192,
   &V_NARROWK32_W4_N2_D192, &V_WIDEK96_W8_N2_D192,
