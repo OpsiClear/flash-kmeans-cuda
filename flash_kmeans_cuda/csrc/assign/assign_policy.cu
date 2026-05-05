@@ -108,18 +108,10 @@ constexpr Variant V_WIDEK32_W8_N4_D224= make_variant<128,  32, 8, 2, 4, 224, tru
 constexpr Variant V_WIDEK48_W8_N2_D192= make_variant<128,  48, 8, 2, 2, 192, true>("widek48_w8_n2_d192");
 constexpr Variant V_WIDEK48_W8_N4_D192= make_variant<128,  48, 8, 2, 4, 192, true>("widek48_w8_n4_d192");
 
-// SMEM_PAD=0 variants: drop the bank-conflict pad to fit shapes that are
-// just-barely-over the cap. The pad eats 16 bytes per row × (BN + STAGES*BK)
-// rows. At BN=128 BK=32 STAGES=2 that's 16 * (128 + 64) = 3 KB, enough to
-// unlock WIDEK32 at D=256. Bank conflicts at D=256 are partly natural since
-// 256+0=256 is divisible by 32 — but 256 % 32 = 0 maps each row's start to
-// the same bank, which IS the worst case. Try anyway and let autotune decide.
-//   D=256 BN=128 BK=32 S=2 PAD=0: 65536 + 32768 + 256 = 96 KB ✓
-//   D=224 BN=128 BK=48 S=2 PAD=0: 57344 + 43008 + 384 = 99 KB ✓ barely
-constexpr Variant V_WIDEK32_W8_N2_D256_P0= make_variant<128,  32, 8, 2, 2, 256, true, 0, 0>("widek32_w8_n2_d256_p0");
-constexpr Variant V_WIDEK32_W8_N4_D256_P0= make_variant<128,  32, 8, 2, 4, 256, true, 0, 0>("widek32_w8_n4_d256_p0");
-constexpr Variant V_WIDEK48_W8_N2_D224_P0= make_variant<128,  48, 8, 2, 2, 224, true, 0, 0>("widek48_w8_n2_d224_p0");
-constexpr Variant V_WIDEK48_W8_N4_D224_P0= make_variant<128,  48, 8, 2, 4, 224, true, 0, 0>("widek48_w8_n4_d224_p0");
+// SMEM_PAD=0 variants tried for D=224/256 (to fit just-over-cap shapes): all
+// 3-6x slower than the padded BK=32 winner due to catastrophic bank conflicts
+// when row-stride is divisible by 32. SMEM_PAD plumbing kept as a template
+// parameter for future use, but no PAD=0 variants ship today.
 
 // STAGES=1 wider-BK candidates for D=320/384 were tried (20-30% slower than
 // STAGES=2 BK=32) — async pipeline overlap matters more than bigger K-chunks
@@ -229,17 +221,17 @@ constexpr PolicyRow kD192 = {
 };
 
 constexpr PolicyRow kD224 = {
-  &V_WIDEK48_W8_N2_D224_P0, &V_WIDEK32_W8_N2_D224,
-  &V_WIDEK48_W8_N4_D224_P0, &V_WIDEK32_W8_N4_D224,
-  &V_NARROWK64_W4_N2_D224, &V_NARROWK48_W4_N2_D224,
-  &V_NARROWK32_W4_N2_D224, &V_NARROWK32_W4,
+  &V_WIDEK32_W8_N2_D224, &V_WIDEK32_W8_N4_D224,
+  &V_NARROWK64_W4_N2_D224, &V_NARROWK64_W4_N4_D224,
+  &V_NARROWK48_W4_N2_D224, &V_NARROWK32_W4_N2_D224,
+  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD256 = {
-  &V_WIDEK32_W8_N2_D256_P0, &V_WIDEK32_W8_N4_D256_P0,
-  &V_NARROWK48_W4_N4_D256, &V_NARROWK48_W4_N2_D256,
-  &V_NARROWK32_W4_N2_D256, &V_WIDE_3_W8_N2_D256,
-  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
+  &V_NARROWK48_W4_N4_D256, &V_NARROWK32_S3_W4_N2_D256,
+  &V_NARROWK48_W4_N2_D256, &V_NARROWK32_W4_N2_D256,
+  &V_WIDE_3_W8_N2_D256, &V_NARROWK32_W4_N2,
+  &V_NARROWK32_W4, &V_DEEP_2_W4,
 };
 
 constexpr PolicyRow kD320 = {
