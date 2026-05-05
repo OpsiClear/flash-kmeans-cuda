@@ -104,6 +104,10 @@ constexpr Variant V_WIDEK32_W8_N4_D192= make_variant<128,  32, 8, 2, 4, 192, tru
 constexpr Variant V_WIDEK32_W8_N2_D224= make_variant<128,  32, 8, 2, 2, 224, true>("widek32_w8_n2_d224");
 constexpr Variant V_WIDEK32_W8_N4_D224= make_variant<128,  32, 8, 2, 4, 224, true>("widek32_w8_n4_d224");
 
+// BN=128 W=8 BK=48 fits only at D=192 (88 KB); D=224 = 104 KB over.
+constexpr Variant V_WIDEK48_W8_N2_D192= make_variant<128,  48, 8, 2, 2, 192, true>("widek48_w8_n2_d192");
+constexpr Variant V_WIDEK48_W8_N4_D192= make_variant<128,  48, 8, 2, 4, 192, true>("widek48_w8_n4_d192");
+
 // STAGES=1 wider-BK candidates for D=320/384 were tried (20-30% slower than
 // STAGES=2 BK=32) — async pipeline overlap matters more than bigger K-chunks
 // at large D. To break past the BK=32 cap at D=320/384 needs SMEM_PAD reduction
@@ -205,10 +209,10 @@ constexpr PolicyRow kD128 = {
 // stay reachable via FKC_NTILES={1,4} (kRowsN1/kRowsN4) and via FKC_NARROW
 // (kForcedNarrow*).
 constexpr PolicyRow kD192 = {
-  &V_WIDEK32_W8_N2_D192, &V_NARROWK64_W4_N2_D192,
-  &V_WIDEK32_W8_N4_D192, &V_NARROWK64_W4_N4_D192,
-  &V_NARROWK48_W4_N2_D192, &V_NARROWK32_W4_N2_D192,
-  &V_NARROWK32_W4_N2, &V_NARROWK32_W4,
+  &V_WIDEK48_W8_N2_D192, &V_WIDEK32_W8_N2_D192,
+  &V_WIDEK48_W8_N4_D192, &V_WIDEK32_W8_N4_D192,
+  &V_NARROWK64_W4_N2_D192, &V_NARROWK48_W4_N2_D192,
+  &V_NARROWK32_W4_N2_D192, &V_NARROWK32_W4,
 };
 
 constexpr PolicyRow kD224 = {
