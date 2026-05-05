@@ -30,7 +30,7 @@ set "BUILD_LOG=.autotune\build-d-sweep.log"
 set "BENCH_LOG=.autotune\bench-d-sweep.log"
 
 echo === build arch=%TORCH_CUDA_ARCH_LIST% max_jobs=%MAX_JOBS% ===
-uv pip install -e . --no-build-isolation --reinstall-package flash-kmeans-cuda --verbose > "%BUILD_LOG%" 2>&1
+uv run --no-sync python setup.py build_ext --inplace > "%BUILD_LOG%" 2>&1
 if errorlevel 1 (
   echo BUILD_FAILED
   type "%BUILD_LOG%"
