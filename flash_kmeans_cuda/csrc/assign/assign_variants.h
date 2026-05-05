@@ -29,10 +29,11 @@ struct LaunchCtx {
   cudaStream_t stream;
 };
 
-template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false, int KMin = 0>
+template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false,
+          int KMin = 0, int Pad = SMEM_PAD>
 struct VariantSpec {
   static size_t smem(int D, size_t elt) {
-    return compute_smem_bytes(BN, BK, D, S, elt);
+    return compute_smem_bytes(BN, BK, D, S, elt, Pad);
   }
 
   template <class T>
@@ -44,7 +45,7 @@ struct VariantSpec {
       if (c.K < KMin) return false;
     }
     if (smem(c.D, c.elt_sz) > c.smem_limit) return false;
-    launch_typed_select_csq<T, BN, BK, W, S, NT, DFix, Raw>(
+    launch_typed_select_csq<T, BN, BK, W, S, NT, DFix, Raw, Pad>(
         c.x, c.centroids, c.x_sq, c.c_sq, c.cluster_ids,
         c.B, c.N, c.K, c.D, c.stream, c.async_csq);
     return true;
@@ -58,9 +59,10 @@ struct Variant {
   size_t (*smem)(int D, size_t elt);
 };
 
-template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false, int KMin = 0>
+template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false,
+          int KMin = 0, int Pad = SMEM_PAD>
 constexpr Variant make_variant(const char* name) {
-  using Spec = VariantSpec<BN, BK, W, S, NT, DFix, Raw, KMin>;
+  using Spec = VariantSpec<BN, BK, W, S, NT, DFix, Raw, KMin, Pad>;
   return Variant{
     name,
     &Spec::template try_launch<__half>,

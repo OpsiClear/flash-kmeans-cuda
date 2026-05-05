@@ -144,8 +144,8 @@ __device__ __forceinline__ void store_csq_tile(
 // a mismatch causes cudaErrorInvalidDeviceFunction at runtime, not at link
 // time.
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
-          int N_TILES_PER_CTA = 1, bool ASYNC_CSQ = false, int D_FIXED = 0,
-          bool RAW_DIST = false>
+          int N_TILES_PER_CTA, bool ASYNC_CSQ, int D_FIXED,
+          bool RAW_DIST, int SMEM_PAD_TPL>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -168,7 +168,7 @@ assign_sm80_kernel(
   const int warp_id = tid / kWarp;
   const int lane = tid % kWarp;
   const int D_TILE = (D_FIXED > 0) ? D_FIXED : D;
-  const int D_SMEM = D_TILE + SMEM_PAD;
+  const int D_SMEM = D_TILE + SMEM_PAD_TPL;
 
   // SMEM layout (with row-stride padding D_SMEM = D + SMEM_PAD):
   //   x_smem [BLOCK_N * D_SMEM]              (re-loaded per n_tile)
