@@ -232,7 +232,7 @@ __device__ __forceinline__ void store_csq_tile(
 // time.
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
           int N_TILES_PER_CTA, bool ASYNC_CSQ, int D_FIXED,
-          bool RAW_DIST, bool FP32_ACC, int SMEM_PAD_TPL>
+          bool RAW_DIST, bool FP32_ACC, bool SIMILARITY, int SMEM_PAD_TPL>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -323,16 +323,18 @@ assign_sm80_kernel(
       async_load_tile<T, THREADS_PER_CTA>(c_dst,
                          centroids + (size_t)pid_b * K * D_LOAD + (size_t)k_start * D_LOAD,
                          k_count, BLOCK_K, D_LOAD, D_TILE, D_SMEM);
-      static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
-      const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
-      if constexpr (ASYNC_CSQ) {
-        if (k_count == BLOCK_K) {
-          async_load_csq_full_tile<THREADS_PER_CTA>(csq_dst, csq_src, BLOCK_K);
+      if constexpr (!SIMILARITY) {
+        static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
+        const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
+        if constexpr (ASYNC_CSQ) {
+          if (k_count == BLOCK_K) {
+            async_load_csq_full_tile<THREADS_PER_CTA>(csq_dst, csq_src, BLOCK_K);
+          } else {
+            store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
+          }
         } else {
           store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
         }
-      } else {
-        store_csq_tile<THREADS_PER_CTA>(csq_dst, csq_src, k_count, BLOCK_K);
       }
       ptx::cp_async_commit();
     };
@@ -365,9 +367,9 @@ assign_sm80_kernel(
       int row_bot = warp_id * WARP_M + m * 16 + row_bot_in_warp;
       top_valid_cache[m] = row_top < n_count;
       bot_valid_cache[m] = row_bot < n_count;
-      if constexpr (RAW_DIST) {
+      if constexpr (RAW_DIST || SIMILARITY) {
         // x_sq is constant across all candidate centroids for a row, so the
-        // raw-distance argmin can omit it and skip these global loads.
+        // raw-distance/similarity argmin can omit it and skip these global loads.
         xs_top_cache[m] = 0.f;
         xs_bot_cache[m] = 0.f;
       } else {
@@ -477,22 +479,29 @@ assign_sm80_kernel(
             int k_in_chunk_1 = k_in_chunk_0 + 1;
             int k_global_0 = k_start + k_in_chunk_0;
             int k_global_1 = k_start + k_in_chunk_1;
-            float cs0 = c_sq_tile[k_in_chunk_0];
-            float cs1 = c_sq_tile[k_in_chunk_1];
 
             float a_top0, a_top1, a_bot0, a_bot1;
             unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
-            if constexpr (RAW_DIST) {
-              update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
-              update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
-              update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
-              update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+            if constexpr (SIMILARITY) {
+              update_best(best[m * 2 + 0], -a_top0, k_global_0);
+              update_best(best[m * 2 + 0], -a_top1, k_global_1);
+              update_best(best[m * 2 + 1], -a_bot0, k_global_0);
+              update_best(best[m * 2 + 1], -a_bot1, k_global_1);
             } else {
-              update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
-              update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
-              update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
-              update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              float cs0 = c_sq_tile[k_in_chunk_0];
+              float cs1 = c_sq_tile[k_in_chunk_1];
+              if constexpr (RAW_DIST) {
+                update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+                update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+                update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+                update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+              } else {
+                update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+                update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+                update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+                update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+              }
             }
           }
         }
@@ -510,28 +519,40 @@ assign_sm80_kernel(
             int k_in_chunk_1 = k_in_chunk_0 + 1;
             int k_global_0 = k_start + k_in_chunk_0;
             int k_global_1 = k_start + k_in_chunk_1;
-            float cs0 = c_sq_tile[k_in_chunk_0];
-            float cs1 = c_sq_tile[k_in_chunk_1];
 
             float a_top0, a_top1, a_bot0, a_bot1;
             unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
             if (top_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
-                update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 0], -a_top0, k_global_0);
+                update_best(best[m * 2 + 0], -a_top1, k_global_1);
               } else {
-                update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
-                update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+                float cs0 = c_sq_tile[k_in_chunk_0];
+                float cs1 = c_sq_tile[k_in_chunk_1];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+                  update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+                } else {
+                  update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+                  update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+                }
               }
             }
             if (bot_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
-                update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 1], -a_bot0, k_global_0);
+                update_best(best[m * 2 + 1], -a_bot1, k_global_1);
               } else {
-                update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
-                update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+                float cs0 = c_sq_tile[k_in_chunk_0];
+                float cs1 = c_sq_tile[k_in_chunk_1];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+                  update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+                } else {
+                  update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+                  update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+                }
               }
             }
           }
@@ -553,41 +574,59 @@ assign_sm80_kernel(
           int k_global_1 = k_start + k_in_chunk_1;
           bool k0_valid = k_global_0 < K;
           bool k1_valid = k_global_1 < K;
-          float cs0 = c_sq_tile[k_in_chunk_0];
-          float cs1 = c_sq_tile[k_in_chunk_1];
 
           float a_top0, a_top1, a_bot0, a_bot1;
           unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
           if (top_valid) {
             if (k0_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 0], -a_top0, k_global_0);
               } else {
-                update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+                float cs0 = c_sq_tile[k_in_chunk_0];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
+                } else {
+                  update_best(best[m * 2 + 0], to_dist(a_top0, xs_top, cs0), k_global_0);
+                }
               }
             }
             if (k1_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 0], -a_top1, k_global_1);
               } else {
-                update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+                float cs1 = c_sq_tile[k_in_chunk_1];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 0], cs1 - 2.0f * a_top1, k_global_1);
+                } else {
+                  update_best(best[m * 2 + 0], to_dist(a_top1, xs_top, cs1), k_global_1);
+                }
               }
             }
           }
           if (bot_valid) {
             if (k0_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 1], -a_bot0, k_global_0);
               } else {
-                update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+                float cs0 = c_sq_tile[k_in_chunk_0];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 1], cs0 - 2.0f * a_bot0, k_global_0);
+                } else {
+                  update_best(best[m * 2 + 1], to_dist(a_bot0, xs_bot, cs0), k_global_0);
+                }
               }
             }
             if (k1_valid) {
-              if constexpr (RAW_DIST) {
-                update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+              if constexpr (SIMILARITY) {
+                update_best(best[m * 2 + 1], -a_bot1, k_global_1);
               } else {
-                update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+                float cs1 = c_sq_tile[k_in_chunk_1];
+                if constexpr (RAW_DIST) {
+                  update_best(best[m * 2 + 1], cs1 - 2.0f * a_bot1, k_global_1);
+                } else {
+                  update_best(best[m * 2 + 1], to_dist(a_bot1, xs_bot, cs1), k_global_1);
+                }
               }
             }
           }

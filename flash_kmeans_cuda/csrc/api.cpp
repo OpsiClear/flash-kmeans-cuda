@@ -65,6 +65,35 @@ void validate_assign_inputs(
               "all tensors must be contiguous");
 }
 
+void validate_similarity_inputs(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    const at::Tensor& cluster_ids) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(centroids.is_cuda(), "centroids must be a CUDA tensor");
+  TORCH_CHECK(cluster_ids.is_cuda(), "cluster_ids must be a CUDA tensor");
+  TORCH_CHECK(x.dim() == 3, "x must be (B, N, D)");
+  TORCH_CHECK(centroids.dim() == 3, "centroids must be (B, K, D)");
+  TORCH_CHECK(x.scalar_type() == centroids.scalar_type(),
+              "x and centroids must share dtype");
+  TORCH_CHECK(cluster_ids.scalar_type() == at::kInt, "cluster_ids must be int32");
+
+  const int64_t B = x.size(0);
+  const int64_t N = x.size(1);
+  const int64_t D = x.size(2);
+  TORCH_CHECK(centroids.size(0) == B && centroids.size(2) == D,
+              "centroids must be (B, K, D) matching x");
+  TORCH_CHECK(cluster_ids.dim() == 2 && cluster_ids.size(0) == B &&
+              cluster_ids.size(1) == N,
+              "cluster_ids must be (B, N) int32");
+  TORCH_CHECK(x.device() == centroids.device() &&
+              x.device() == cluster_ids.device(),
+              "all tensors must be on the same CUDA device");
+  TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
+              cluster_ids.is_contiguous(),
+              "all tensors must be contiguous");
+}
+
 }  // namespace
 
 at::Tensor euclid_assign(
@@ -90,6 +119,29 @@ at::Tensor euclid_assign_out(
     fkc::assign::launch_assign_sm80(x, centroids, x_sq, c_sq, cluster_ids);
   } else {
     fkc::assign::launch_assign_safe(x, centroids, x_sq, c_sq, cluster_ids);
+  }
+  return cluster_ids;
+}
+
+at::Tensor similarity_assign(
+    const at::Tensor& x,
+    const at::Tensor& centroids) {
+  at::Tensor cluster_ids = at::empty(
+      {x.size(0), x.size(1)},
+      at::TensorOptions().dtype(at::kInt).device(x.device()));
+  return similarity_assign_out(x, centroids, cluster_ids);
+}
+
+at::Tensor similarity_assign_out(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    at::Tensor cluster_ids) {
+  validate_similarity_inputs(x, centroids, cluster_ids);
+
+  if (can_use_sm80_path(x) && !force_safe_path()) {
+    fkc::assign::launch_similarity_assign_sm80(x, centroids, cluster_ids);
+  } else {
+    fkc::assign::launch_similarity_assign_safe(x, centroids, cluster_ids);
   }
   return cluster_ids;
 }

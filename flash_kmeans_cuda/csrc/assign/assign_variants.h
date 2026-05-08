@@ -27,6 +27,7 @@ struct LaunchCtx {
   size_t smem_limit;
   bool async_csq;
   cudaStream_t stream;
+  bool similarity = false;
 };
 
 template <int BN, int BK, int W, int S, int NT, int DFix = 0, bool Raw = false,
@@ -49,7 +50,7 @@ struct VariantSpec {
     if (smem(c.D, c.elt_sz) > c.smem_limit) return false;
     launch_typed_select_csq<T, BN, BK, W, S, NT, DFix, Raw, Fp32Acc, Pad>(
         c.x, c.centroids, c.x_sq, c.c_sq, c.cluster_ids,
-        c.B, c.N, c.K, c.D, c.stream, c.async_csq);
+        c.B, c.N, c.K, c.D, c.stream, c.async_csq, c.similarity);
     return true;
   }
 };
@@ -93,7 +94,7 @@ struct PaddedDVariantSpec {
     if (smem(c.D, c.elt_sz) > c.smem_limit) return false;
     launch_typed_select_csq<T, BN, BK, W, S, NT, DPad, Raw, Fp32Acc, Pad>(
         c.x, c.centroids, c.x_sq, c.c_sq, c.cluster_ids,
-        c.B, c.N, c.K, c.D, c.stream, c.async_csq);
+        c.B, c.N, c.K, c.D, c.stream, c.async_csq, c.similarity);
     return true;
   }
 };

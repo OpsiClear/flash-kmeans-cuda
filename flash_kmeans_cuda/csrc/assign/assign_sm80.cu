@@ -134,6 +134,77 @@ void launch_assign_sm80(const at::Tensor& x,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void launch_similarity_assign_sm80(const at::Tensor& x,
+                                   const at::Tensor& centroids,
+                                   at::Tensor& cluster_ids) {
+  TORCH_CHECK(x.is_cuda() && centroids.is_cuda(),
+              "x and centroids must be CUDA tensors");
+  TORCH_CHECK(x.dim() == 3 && centroids.dim() == 3,
+              "x and centroids must be 3D (B,N,D)/(B,K,D)");
+  TORCH_CHECK(x.scalar_type() == centroids.scalar_type(),
+              "x and centroids must share dtype");
+  TORCH_CHECK(cluster_ids.scalar_type() == at::kInt,
+              "cluster_ids must be int32");
+
+  int B = x.size(0);
+  int N = x.size(1);
+  int D = x.size(2);
+  int K = centroids.size(1);
+  TORCH_CHECK(centroids.size(0) == B && centroids.size(2) == D,
+              "centroids must be (B, K, D) matching x");
+  TORCH_CHECK((D >= 3 && D < BLOCK_D) || D % BLOCK_D == 0,
+              "similarity_assign_sm80: D must be 3..15 or a multiple of 16 (got ", D, ")");
+  TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
+              cluster_ids.is_contiguous(),
+              "all tensors must be contiguous");
+
+  c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  int dev = x.device().index();
+  cudaDeviceProp props{};
+  cudaGetDeviceProperties(&props, dev);
+  size_t smem_limit = props.sharedMemPerBlockOptin;
+  if (smem_limit == 0) smem_limit = props.sharedMemPerBlock;
+
+  at::Tensor dummy;
+  LaunchCtx ctx{
+    x, centroids, dummy, dummy, cluster_ids,
+    B, N, K, D,
+    static_cast<size_t>(x.element_size()), smem_limit,
+    /*async_csq=*/false,
+    stream,
+    /*similarity=*/true,
+  };
+
+  EnvKnobs knobs = read_env_knobs();
+  int dtype_idx = dtype_index_of(x.scalar_type());
+  TORCH_CHECK(dtype_idx >= 0, "similarity_assign_sm80 requires fp16 or bf16 input");
+
+  VariantView candidates{nullptr, 0};
+  if (knobs.has_force_override()) {
+    candidates = build_forced_candidates(knobs, ctx);
+  } else {
+    candidates = static_policy(dtype_idx, d_index_of(D), k_bucket_of(K),
+                               knobs.n_tiles_override);
+  }
+
+  bool launched = false;
+  bool is_fp16 = (x.scalar_type() == at::kHalf);
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const Variant* v = candidates[i];
+    if (!v) break;
+    bool ok = is_fp16 ? v->try_fp16(ctx) : v->try_bf16(ctx);
+    if (ok) { launched = true; break; }
+  }
+
+  if (!launched) {
+    launch_similarity_assign_safe(x, centroids, cluster_ids);
+    return;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 
 }  // namespace assign
 }  // namespace fkc

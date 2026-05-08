@@ -45,6 +45,17 @@ FKC_API at::Tensor euclid_assign_out(
     const at::Tensor& c_sq,
     at::Tensor cluster_ids);
 
+// Allocate and return (B, N) int32 ids for argmax_k x @ centroid_k.
+FKC_API at::Tensor similarity_assign(
+    const at::Tensor& x,
+    const at::Tensor& centroids);
+
+// Write similarity assignment into caller-provided (B, N) int32 cluster_ids.
+FKC_API at::Tensor similarity_assign_out(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    at::Tensor cluster_ids);
+
 // Sorted-run centroid accumulation. centroid_sums and centroid_counts are
 // zeroed by this wrapper before launching the CUDA accumulator.
 FKC_API void centroid_update_sorted(

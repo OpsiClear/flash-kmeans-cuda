@@ -56,6 +56,22 @@ def euclid_assign(
     return _C.euclid_assign(x, centroids, x_sq, c_sq, out)
 
 
+def similarity_assign(
+    x: torch.Tensor,
+    centroids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Assign each point to the centroid with maximum dot product.
+
+    This is the CUDA dot-product argmax assignment path used by cosine/dot
+    compatibility APIs. It avoids norm buffers and does not materialize a full
+    similarity matrix in PyTorch.
+    """
+    x = _ensure_contig(x, "x")
+    centroids = _ensure_contig(centroids, "centroids")
+    return _C.similarity_assign(x, centroids, out)
+
+
 def centroid_update_sorted(
     x: torch.Tensor,
     cluster_ids: torch.Tensor,

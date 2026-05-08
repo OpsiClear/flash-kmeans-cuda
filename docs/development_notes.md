@@ -6,10 +6,8 @@ This file captures maintainer and agent notes for working on this repository.
 
 Two parallel implementations:
 
-- `flash_kmeans_cuda/` — hand-rolled CUDA port for the Euclidean hot path. Built as a torch C++/CUDA extension via `setup.py` / `pyproject.toml`, and as a libtorch shared library via `CMakeLists.txt`. Sources live under `flash_kmeans_cuda/csrc/`. `api.cpp` owns validation and dispatch for both the Python extension and the C++ shared library; `bindings.cpp` is only the nanobind adapter. The default fp16/bf16 path uses the SM80 tensor-core assignment kernel when a supported policy row fits, and falls back to `assign_safe.cu` for fp32 or unsupported shapes.
+- `flash_kmeans_cuda/` — hand-rolled CUDA port for the Euclidean hot path. Built as a torch C++/CUDA extension via `setup.py` / `pyproject.toml`, and as a libtorch shared library via `CMakeLists.txt`. Sources live under `flash_kmeans_cuda/csrc/`. `api.cpp` owns validation and dispatch for both the Python extension and the C++ shared library; `bindings.cpp` is only the nanobind adapter. The default fp16/bf16 path uses the SM80 tensor-core assignment kernel when a supported policy row fits, and falls back to `assign_safe.cu` for fp32 or unsupported shapes. The Python package also exposes `FlashKMeans`, CUDA-backed cosine/dot K-Means on CUDA tensors, and single-device large-N chunking compatibility.
 - `third_party/flash-kmeans/` — upstream Triton implementation, vendored. Untouched; used as the correctness oracle in `tests/test_correctness.py`. Treat as a working copy of the upstream project.
-
-Cosine, Dot, and `kmeans_largeN` are intentionally not in the CUDA port — callers can keep using `flash_kmeans` for those.
 
 ## Python environment
 
@@ -97,6 +95,7 @@ Benchmarks:
 ```powershell
 uv run --no-sync python benchmarks/bench_d_sweep.py --n 32768 --k 8192 --d 1 2 3 4 8 16 128 192 224 256 320 384 --rounds 30 --warmup 5 --outer 3
 uv run --no-sync python benchmarks/bench_vs_pytorch.py --shape huge --rounds 20 --check-accuracy
+uv run --no-sync python benchmarks/bench_similarity_assign.py --shape mega --rounds 20 --warmup 5 --check-accuracy
 ```
 
 Use `scripts/windows/run_exp*.bat` for one-command build/test/bench loops.
@@ -146,6 +145,10 @@ Default assignment dispatch:
 - fp32 uses the safe kernel.
 - If no SM80 candidate fits the device shared-memory limit, dispatch falls back
   to `assign_safe.cu`.
+- `similarity_assign` reuses the SM80 MMA assignment template with a
+  dot-product argmax epilogue for fp16/bf16 supported shapes. It bypasses
+  x/c norm buffers and uses the safe dot-product kernel for fp32 or unsupported
+  shapes.
 
 The current optimized D set is `1..16, 64, 96, 128, 192, 224, 256, 320, 384`.
 Other multiples of 16 can still route through the generic SM80 fallback chain

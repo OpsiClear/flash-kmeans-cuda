@@ -89,6 +89,7 @@ At runtime on Windows, put `flash_kmeans_cuda.dll` and the torch CUDA DLLs on
 #include <flash_kmeans_cuda/flash_kmeans_cuda.h>
 
 auto ids = fkc::euclid_assign(x, centroids, x_sq, c_sq);
+auto dot_ids = fkc::similarity_assign(x, centroids);
 ```
 
 The API accepts and returns `at::Tensor` objects, so consumers must link

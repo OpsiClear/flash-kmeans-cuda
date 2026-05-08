@@ -118,6 +118,43 @@ assign_safe_kernel(
   cluster_ids[(size_t)pid_b * N + n_idx] = me.idx;
 }
 
+template <typename T>
+__global__ void __launch_bounds__(THREADS_PER_CTA, 4)
+assign_similarity_safe_kernel(
+    const T* __restrict__ x,            // (B, N, D)
+    const T* __restrict__ centroids,    // (B, K, D)
+    int32_t* __restrict__ cluster_ids,  // (B, N)
+    int B, int N, int K, int D) {
+  const int pid_n = blockIdx.x;
+  const int pid_b = blockIdx.y;
+  const int tid = threadIdx.x;
+
+  const int n_idx = pid_n * BLOCK_N + tid;
+  if (n_idx >= N) return;
+
+  const T* x_row = x + (size_t)pid_b * N * D + (size_t)n_idx * D;
+  Best me{FLT_MAX, 0};
+
+  for (int k = 0; k < K; ++k) {
+    const T* c_row = centroids + (size_t)pid_b * K * D + (size_t)k * D;
+    float dot = 0.f;
+    int d = 0;
+    #pragma unroll 4
+    for (; d + 4 <= D; d += 4) {
+      dot += to_fp32(x_row[d + 0]) * to_fp32(c_row[d + 0]);
+      dot += to_fp32(x_row[d + 1]) * to_fp32(c_row[d + 1]);
+      dot += to_fp32(x_row[d + 2]) * to_fp32(c_row[d + 2]);
+      dot += to_fp32(x_row[d + 3]) * to_fp32(c_row[d + 3]);
+    }
+    for (; d < D; ++d) {
+      dot += to_fp32(x_row[d]) * to_fp32(c_row[d]);
+    }
+    update_best(me, -dot, k);
+  }
+
+  cluster_ids[(size_t)pid_b * N + n_idx] = me.idx;
+}
+
 template <typename T, int D_FIXED>
 __global__ void __launch_bounds__(SMALL_D_BLOCK_N, 4)
 assign_small_d_kernel(
@@ -390,6 +427,29 @@ void launch_assign_safe_typed(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename T>
+void launch_similarity_assign_safe_typed(
+    const at::Tensor& x,
+    const at::Tensor& centroids,
+    at::Tensor& cluster_ids) {
+  int B = x.size(0);
+  int N = x.size(1);
+  int D = x.size(2);
+  int K = centroids.size(1);
+
+  c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  dim3 grid((N + BLOCK_N - 1) / BLOCK_N, B);
+  dim3 block(THREADS_PER_CTA);
+  assign_similarity_safe_kernel<T><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const T*>(x.data_ptr()),
+      reinterpret_cast<const T*>(centroids.data_ptr()),
+      cluster_ids.data_ptr<int32_t>(),
+      B, N, K, D);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 
@@ -425,6 +485,26 @@ void launch_assign_safe(const at::Tensor& x,
     launch_assign_safe_typed<float>(x, centroids, x_sq, c_sq, cluster_ids);
   } else {
     TORCH_CHECK(false, "assign_safe: unsupported dtype ", x.scalar_type());
+  }
+}
+
+void launch_similarity_assign_safe(const at::Tensor& x,
+                                   const at::Tensor& centroids,
+                                   at::Tensor& cluster_ids) {
+  TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+  TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
+              cluster_ids.is_contiguous(),
+              "all tensors must be contiguous");
+  TORCH_CHECK(cluster_ids.scalar_type() == at::kInt, "cluster_ids must be int32");
+
+  if (x.scalar_type() == at::kHalf) {
+    launch_similarity_assign_safe_typed<__half>(x, centroids, cluster_ids);
+  } else if (x.scalar_type() == at::kBFloat16) {
+    launch_similarity_assign_safe_typed<__nv_bfloat16>(x, centroids, cluster_ids);
+  } else if (x.scalar_type() == at::kFloat) {
+    launch_similarity_assign_safe_typed<float>(x, centroids, cluster_ids);
+  } else {
+    TORCH_CHECK(false, "similarity_assign_safe: unsupported dtype ", x.scalar_type());
   }
 }
 

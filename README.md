@@ -12,9 +12,12 @@ Torch 2.11, CUDA 13, fp16/bf16 Euclidean assignment over large `N` and `K`.
 
 ## Status
 
-This is an optimization-oriented CUDA port. The main supported fast path is
-Euclidean K-Means on CUDA tensors. Cosine, dot-product, and large-N CPU
-streaming remain in the upstream Triton project, not this CUDA port.
+This is an optimization-oriented CUDA port. The main fast path is Euclidean
+K-Means on CUDA tensors. The package also exposes the common `flash-kmeans`
+public API names: cosine and dot-product K-Means use a CUDA dot-product
+assignment path on CUDA tensors and fall back to chunked PyTorch where needed,
+and `kmeans_largeN` / `kmeans_largeN_assign` stream large `(N, D)` inputs to
+one CUDA device in chunks.
 
 Current assignment coverage:
 
@@ -25,6 +28,21 @@ Current assignment coverage:
 - Generic safe fallback for fp32 and unsupported shapes.
 - Per-process in-memory autotuning over candidate kernel variants, enabled by
   default.
+
+API compatibility coverage:
+
+- `batch_kmeans_Euclid`: optimized CUDA path for CUDA tensors.
+- `FlashKMeans`: Euclidean object API compatible with upstream's class.
+- `similarity_assign`: CUDA argmax-dot assignment for fp16/bf16 supported
+  shapes, with safe fallback for fp32/unsupported shapes.
+- `batch_kmeans_Cosine` and `batch_kmeans_Dot`: compatibility loops backed by
+  CUDA similarity assignment/update on CUDA tensors and chunked PyTorch
+  fallbacks otherwise.
+- `kmeans_largeN` and `kmeans_largeN_assign`: single-device chunked large-N
+  compatibility implementations.
+- `triton_centroid_update_euclid` and `triton_centroid_update_sorted_euclid`:
+  Triton-named compatibility wrappers backed by CUDA sorted update on CUDA
+  tensors and PyTorch accumulation otherwise.
 
 Current local RTX 4090 fp16 D=128 assign-only numbers, measured from this tree
 with `TORCH_CUDA_ARCH_LIST=8.9`:
@@ -56,6 +74,15 @@ Current local `N=32768, K=8192` D-sweep sample:
 The D-sweep table is a single local sample. Re-run the commands below on a
 quiet GPU before treating small differences as kernel wins or regressions.
 
+Current local CUDA similarity assignment numbers for `N=32768, K=8192`, fp16:
+
+| D | CUDA ms | CUDA TFLOPS | Speedup vs chunked PyTorch |
+|---:|---:|---:|---:|
+| 3 | 0.1198 | 13.44 | 34.06x |
+| 8 | 0.0809 | 53.09 | 43.55x |
+| 16 | 0.0860 | 99.86 | 37.69x |
+| 128 | 0.3328 | 206.49 | 9.89x |
+
 End-to-end K-Means includes assignment, sorting, centroid update, and finalize,
 so speedups are lower and vary by shape. Use the benchmark commands below for
 numbers on your exact GPU, driver, CUDA toolkit, and D/K mix.
@@ -79,7 +106,12 @@ numbers on your exact GPU, driver, CUDA toolkit, and D/K mix.
 
 ```python
 import torch
-from flash_kmeans_cuda import batch_kmeans_Euclid
+from flash_kmeans_cuda import (
+    FlashKMeans,
+    batch_kmeans_Euclid,
+    batch_kmeans_Cosine,
+    similarity_assign,
+)
 
 x = torch.randn(1, 32768, 128, device="cuda", dtype=torch.float16)
 labels, centroids, n_iters = batch_kmeans_Euclid(
@@ -88,6 +120,12 @@ labels, centroids, n_iters = batch_kmeans_Euclid(
     max_iters=10,
     tol=0.0,
 )
+
+km = FlashKMeans(d=128, k=256, niter=10, device=torch.device("cuda:0"))
+labels_2d = km.fit_predict(x.squeeze(0))
+
+cos_labels, cos_centroids, _ = batch_kmeans_Cosine(x, n_clusters=256, max_iters=10)
+dot_labels = similarity_assign(x, centroids)
 ```
 
 Shape convention:
@@ -103,6 +141,21 @@ The loop mirrors the upstream Euclidean implementation:
 3. sort labels
 4. accumulate centroid sums/counts
 5. finalize new centroids
+
+Large-N API:
+
+```python
+from flash_kmeans_cuda import kmeans_largeN
+
+cpu_x = torch.randn(1_000_000, 128, dtype=torch.float16)
+labels, centroids = kmeans_largeN(
+    cpu_x,
+    n_clusters=4096,
+    max_iters=20,
+    BLOCK_N=131072,
+    device=torch.device("cuda:0"),
+)
+```
 
 ## Build Requirements
 
@@ -235,6 +288,7 @@ Example C++ call:
 #include <flash_kmeans_cuda/flash_kmeans_cuda.h>
 
 auto ids = fkc::euclid_assign(x, centroids, x_sq, c_sq);
+auto dot_ids = fkc::similarity_assign(x, centroids);
 ```
 
 The C++ API accepts and returns `at::Tensor` objects. Consumers must match the
@@ -259,6 +313,12 @@ PyTorch reference comparison:
 
 ```powershell
 uv run --no-sync python benchmarks/bench_vs_pytorch.py --shape huge --rounds 20 --check-accuracy
+```
+
+Dot-product assignment comparison against chunked PyTorch:
+
+```powershell
+uv run --no-sync python benchmarks/bench_similarity_assign.py --shape mega --rounds 20 --warmup 5 --check-accuracy
 ```
 
 End-to-end comparison against upstream `flash_kmeans`. Verify imports if you

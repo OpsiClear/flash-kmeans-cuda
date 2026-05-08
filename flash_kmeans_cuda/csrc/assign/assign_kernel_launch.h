@@ -29,7 +29,8 @@ constexpr int SMEM_PAD = 8;
 // __launch_bounds__ and __restrict__ must match the definition exactly.
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
           int N_TILES_, bool ASYNC_CSQ_, int D_FIXED_, bool RAW_DIST_,
-          bool FP32_ACC_ = false, int SMEM_PAD_ = SMEM_PAD>
+          bool FP32_ACC_ = false, bool SIMILARITY_ = false,
+          int SMEM_PAD_ = SMEM_PAD>
 __global__ void __launch_bounds__(WARPS_ * 32, 1)
 assign_sm80_kernel(const T* __restrict__, const T* __restrict__,
                    const float* __restrict__, const float* __restrict__,
@@ -47,7 +48,7 @@ inline size_t compute_smem_bytes(int BLOCK_N_, int BLOCK_K_, int D,
 template <typename T, int BLOCK_N_, int BLOCK_K_, int WARPS_, int STAGES_,
           int N_TILES_ = 1, bool ASYNC_CSQ_ = false, int D_FIXED_ = 0,
           bool RAW_DIST_ = false, bool FP32_ACC_ = false,
-          int SMEM_PAD_ = SMEM_PAD>
+          bool SIMILARITY_ = false, int SMEM_PAD_ = SMEM_PAD>
 inline void launch_typed(
     const at::Tensor& x, const at::Tensor& centroids,
     const at::Tensor& x_sq, const at::Tensor& c_sq,
@@ -57,7 +58,7 @@ inline void launch_typed(
   size_t smem_bytes = compute_smem_bytes(BLOCK_N_, BLOCK_K_, d_tile, STAGES_, sizeof(T), SMEM_PAD_);
   auto fn = assign_sm80_kernel<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_,
                                N_TILES_, ASYNC_CSQ_, D_FIXED_, RAW_DIST_,
-                               FP32_ACC_, SMEM_PAD_>;
+                               FP32_ACC_, SIMILARITY_, SMEM_PAD_>;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem_bytes));
@@ -68,7 +69,8 @@ inline void launch_typed(
   fn<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<const T*>(x.data_ptr()),
       reinterpret_cast<const T*>(centroids.data_ptr()),
-      x_sq.data_ptr<float>(), c_sq.data_ptr<float>(),
+      SIMILARITY_ ? nullptr : x_sq.data_ptr<float>(),
+      SIMILARITY_ ? nullptr : c_sq.data_ptr<float>(),
       cluster_ids.data_ptr<int32_t>(),
       B, N, K, D);
 }
@@ -87,12 +89,16 @@ inline void launch_typed_select_csq(
     const at::Tensor& x, const at::Tensor& centroids,
     const at::Tensor& x_sq, const at::Tensor& c_sq,
     at::Tensor& cluster_ids,
-    int B, int N, int K, int D, cudaStream_t stream, bool async_csq) {
-  if (async_csq) {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_, RAW_DIST_, FP32_ACC_, SMEM_PAD_>(
+    int B, int N, int K, int D, cudaStream_t stream, bool async_csq,
+    bool similarity = false) {
+  if (similarity) {
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_, RAW_DIST_, FP32_ACC_, true, SMEM_PAD_>(
+        x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
+  } else if (async_csq) {
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, true, D_FIXED_, RAW_DIST_, FP32_ACC_, false, SMEM_PAD_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   } else {
-    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_, RAW_DIST_, FP32_ACC_, SMEM_PAD_>(
+    launch_typed<T, BLOCK_N_, BLOCK_K_, WARPS_, STAGES_, N_TILES_, false, D_FIXED_, RAW_DIST_, FP32_ACC_, false, SMEM_PAD_>(
         x, centroids, x_sq, c_sq, cluster_ids, B, N, K, D, stream);
   }
 }
