@@ -6,7 +6,7 @@ This file captures maintainer and agent notes for working on this repository.
 
 Two parallel implementations:
 
-- `flash_kmeans_cuda/` — hand-rolled CUDA port (Phase A scope: hot Euclidean path only). Built as a torch C++/CUDA extension via `setup.py` / `pyproject.toml` at the repo root. Sources under `flash_kmeans_cuda/csrc/`. The mma.sync kernel in `csrc/assign/assign_sm80.cu` is **experimental** and gated behind `FKC_ASSIGN_USE_MMA=1`; the default fp16/bf16/fp32 path is the tensor-core-free `csrc/assign/assign_safe.cu`. See `flash_kmeans_cuda/ops.py` and `flash_kmeans_cuda/kmeans.py` for the Python surface.
+- `flash_kmeans_cuda/` — hand-rolled CUDA port for the Euclidean hot path. Built as a torch C++/CUDA extension via `setup.py` / `pyproject.toml`, and as a libtorch shared library via `CMakeLists.txt`. Sources live under `flash_kmeans_cuda/csrc/`. `api.cpp` owns validation and dispatch for both the Python extension and the C++ shared library; `bindings.cpp` is only the nanobind adapter. The default fp16/bf16 path uses the SM80 tensor-core assignment kernel when a supported policy row fits, and falls back to `assign_safe.cu` for fp32 or unsupported shapes.
 - `third_party/flash-kmeans/` — upstream Triton implementation, vendored. Untouched; used as the correctness oracle in `tests/test_correctness.py`. Treat as a working copy of the upstream project.
 
 Cosine, Dot, and `kmeans_largeN` are intentionally not in the CUDA port — callers can keep using `flash_kmeans` for those.
@@ -14,7 +14,8 @@ Cosine, Dot, and `kmeans_largeN` are intentionally not in the CUDA port — call
 ## Python environment
 
 Use `uv run` for Python commands in this repository so the locked CUDA/PyTorch
-environment is active: `uv run python ...`, `uv run pip install ...`, etc.
+environment is active: `uv run python ...`. Use `uv pip install ...` for
+package installs into the active project environment.
 
 The CUDA port pins **torch 2.11.\*** built against **CUDA 13.0**, and **Python 3.12** (`requires-python = ">=3.12,<3.13"`). The cu130 wheel index is wired up in `pyproject.toml`:
 
@@ -28,48 +29,77 @@ explicit = true
 torch = { index = "pytorch-cu130" }
 ```
 
-`uv sync` / `uv run pip install -e .` will resolve torch from that index automatically. CPU-only torch will *not* satisfy the build because the extension links against the CUDA runtime.
+`uv sync` / `uv pip install -e .` will resolve torch from that index automatically. CPU-only torch will *not* satisfy the build because the extension links against the CUDA runtime.
 
-Python ↔ C++ glue is **nanobind** (not pybind11). nanobind's `nb_combined.cc` is bundled into the extension build via `setup.py`; the `at::Tensor` caster lives in `flash_kmeans_cuda/csrc/nb_torch.h`. If you add new C++ ops, mirror that file's caster pattern — torch tensors don't auto-cast in nanobind.
+Python ↔ C++ glue is **nanobind** (not pybind11). nanobind's `nb_combined.cpp` is bundled into the extension build via `setup.py`; the `at::Tensor` caster lives in `flash_kmeans_cuda/csrc/nb_torch.h`. If you add new C++ ops, mirror that file's caster pattern — torch tensors don't auto-cast in nanobind.
 
-Triton (used only by the upstream reference) is required for the fast path of `third_party/flash-kmeans`. On Windows the dependency is `triton-windows`, not `triton`. If Triton import fails the upstream package transparently falls back to a torch-native backend, so an "it ran" doesn't prove the Triton path was taken — check imports / warnings.
+Triton is used only by the upstream reference, and it is required for that reference's fast path. Native Windows Triton wheels are unreliable in this environment; use Linux/WSL for clean Triton comparisons. If Triton import fails the upstream package can fall back to a torch-native backend, so an "it ran" doesn't prove the Triton path was taken — check imports / warnings.
 
 ## Common commands
 
-For the CUDA port (run from repo root). The Windows build is finicky and
-requires the MSVC dev environment plus a few PATH tweaks — see the
-helper scripts under `scripts/windows/`. On Linux just `uv sync` and
-`uv run pytest`.
+Run commands from the repository root. The Windows helper
+`scripts/windows/_setup_env.bat` runs `vcvars64.bat`, removes Git's `link.exe`
+from `PATH`, and sets `DISTUTILS_USE_SDK=1` so Torch's CUDAExtension uses the
+active MSVC environment.
 
-**Windows build recipe** (write to a `.bat` file and run via `cmd //c`):
+Initial environment:
 
-```batch
-@echo off
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
-set "PATH=%PATH:C:\Program Files\Git\usr\bin;=%"
-set "PATH=%PATH:C:\Program Files\Git\mingw64\bin;=%"
-set "PATH=%PATH:C:\Program Files\Git\usr\local\bin;=%"
-set DISTUTILS_USE_SDK=1
-uv sync                                                  & rem first build
-uv pip install -e . --no-build-isolation --reinstall-package flash-kmeans-cuda  & rem rebuild after kernel edits
-uv run python -m pytest tests/
+```powershell
+uv sync --locked --python 3.12
 ```
 
-Why each step:
-- `vcvars64.bat` puts MSVC's `cl`/`link` on PATH and sets `INCLUDE`/`LIB`.
-- The `set "PATH=...=="` lines remove Git's `link.exe` (a GNU coreutils alias for `ln`) so distutils picks MSVC's linker.
-- `DISTUTILS_USE_SDK=1` tells torch's CUDAExtension that the VC env is already configured.
-- `--no-build-isolation` is critical for incremental rebuilds: it makes the build use the venv's already-installed cu130 torch, avoiding ABI mismatch with what the runtime loads.
+Fast Windows editable build for RTX 4090 / `sm_89`:
 
-**Common commands** (all paths after a successful build):
-
-```bash
-uv run python -m pytest tests/                  # full test suite
-FKC_ASSIGN_FORCE_SAFE=1 uv run python -m pytest # debug: bypass mma path
-
-uv run python benchmarks/bench_vs_triton.py \
-    --batch-size 1 --num-points 32768 --dim 128 --num-clusters 256 --max-iters 5
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e . --no-build-isolation"
 ```
+
+Install `pytest` for local smoke and dispatch tests:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install pytest"
+```
+
+Rebuild after CUDA/C++ edits:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e . --no-build-isolation --reinstall-package flash-kmeans-cuda"
+```
+
+Focused validation:
+
+```powershell
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/test_assign_dispatch_equiv.py -q"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/test_shapes.py tests/test_dtypes.py tests/test_mma_optin.py -q"
+```
+
+Install the full `dev` extra when you need the upstream `flash-kmeans` oracle:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c 'scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e ".[dev]" --no-build-isolation'
+```
+
+The `dev` extra installs the upstream reference package. Triton wheels are
+unreliable on native Windows; use Linux/WSL for clean Triton comparisons.
+
+Full suite after the required test dependencies are installed:
+
+```powershell
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/ -q"
+```
+
+Benchmarks:
+
+```powershell
+uv run --no-sync python benchmarks/bench_d_sweep.py --n 32768 --k 8192 --d 1 2 3 4 8 16 128 192 224 256 320 384 --rounds 30 --warmup 5 --outer 3
+uv run --no-sync python benchmarks/bench_vs_pytorch.py --shape huge --rounds 20 --check-accuracy
+```
+
+Use `scripts/windows/run_exp*.bat` for one-command build/test/bench loops.
 
 For the upstream Triton reference (run from `third_party/flash-kmeans/`):
 
@@ -91,72 +121,50 @@ The CUDA port has a pytest suite under `tests/`; the upstream project does not.
 
 ### CUDA port (`flash_kmeans_cuda/`)
 
-Three kernels behind a Python iteration driver that mirrors `kmeans_triton_impl.py:55-110`:
+Main source responsibilities:
 
-- `csrc/assign/assign_safe.cu` — Euclidean assignment for fp32 and fallback for fp16/bf16. One thread per (batch, point); streams K with fp32 accumulation. Tensor-core-free. Used by default for fp32; used as fallback for fp16/bf16 when the SMEM budget for the mma kernel doesn't fit (D=256 on Ada).
-- `csrc/assign/assign_sm80.cu` — **default** m16n8k16 mma.sync kernel for fp16/bf16. Both A and B operand registers are populated via `ldmatrix.x4` (no `.trans`). The trick on B: viewed as a (rows=N, cols=K) matrix in our `(BLOCK_K, D)` row-major SMEM, ldmatrix.x4's post-load distribution `(N=t/4, K=2*(t%4)..+1)` is exactly what mma B expects, and a single `ldmatrix.x4` covers two N-atoms at once via the bit-3 (N-half) / bit-4 (K-half) lane partition. SMEM rows are padded by `SMEM_PAD = 8` fp16 (16 bytes) to break the 32-way bank conflict that hits power-of-2 D values; the 16-byte pad also preserves cp.async's 16-byte alignment. The min-over-K reduction is fused: each mma's output is reduced into per-thread `Best` registers immediately, so the cross-product tile is never materialized to SMEM (the structural diff vs Triton's `tl.dot`).
+- `csrc/api.cpp`: central validation and dispatch for both Python and C++.
+- `csrc/bindings.cpp`: nanobind module; delegates assignment to `api.cpp`.
+- `csrc/assign/assign_sm80.cu`: fp16/bf16 SM80+ tensor-core assignment
+  launcher.
+- `csrc/assign/assign_sm80_kernel.cuh`: core MMA kernel template.
+- `csrc/assign/assign_policy.cu`: constexpr variant catalog and static policy
+  rows.
+- `csrc/assign/assign_autotune.cu`: in-memory first-call autotuner over the
+  top feasible candidates per `(dtype, D, K bucket)` cell.
+- `csrc/assign/assign_safe.cu`: fp32 path and exact/safe fallback, including
+  small-D scalar/sorted helpers.
+- `csrc/update/update_sorted.cu`: sorted centroid sum/count accumulator.
+- `csrc/update/update_finalize.cu`: `sum/count` finalize with empty-cluster
+  preservation.
 
-The launcher compiles four kernel variants and picks the largest that fits the device's per-block dynamic SMEM budget:
-- `wide × 8 warps × 3 stages`  — preferred for K ≥ 512 (more warps/SM = better latency hiding under SMEM-bound 1-CTA/SM occupancy on Ada)
-- `wide × 4 warps × 3 stages`  — preferred for K < 512 (more M-atoms per warp = higher arithmetic intensity)
-- `wide × 4 warps × 2 stages`  — fallback for D=192 etc. where 3-stage SMEM is tight
-- `deep × 4 warps × 2 stages`  — fallback when wide doesn't fit; opt-in via `FKC_ASSIGN_DEEP_TILE=1`
-- `safe` kernel — final fallback when no mma tile fits (D=256 on Ada)
+Default assignment dispatch:
 
-Set `FKC_ASSIGN_FORCE_SAFE=1` to bypass mma entirely for debugging.
+- fp16/bf16 `D=3..15` and `D % 16 == 0` enter the SM80 policy dispatcher.
+- `D=1` and `D=2` use safe small-D paths by default because tensor-core padded
+  variants lose too many ties at very low dimension.
+- fp32 uses the safe kernel.
+- If no SM80 candidate fits the device shared-memory limit, dispatch falls back
+  to `assign_safe.cu`.
 
-**Iter-loop overhead optimizations** (`flash_kmeans_cuda/kmeans.py`):
-- `compute_shift=False` when `tol<=0` — eliminates a (B,K,D) fp32 cast + norm + max + `.item()` sync per iter. With K=2048 the savings are 17% of full-iter time on big shapes.
-- Pre-allocated buffers ping-pong'd across iterations (cluster_ids, sums, counts, centroid double-buffer) to avoid per-iter allocator churn. Sums/counts are allocated with `empty`; `centroid_update_sorted` zeroes caller-provided buffers each iteration, so `zeros` here was a redundant setup memset.
-- For fp16 D=128/K>=256 on the default raw assign path, skip the initial `x_sq = (x.float() ** 2).sum(...)` setup and pass a dummy fp32 buffer, because the kernel's raw argmin score omits row-constant `x_sq`. Debug tile env vars and safe-mode force the exact `x_sq` compute.
-- Centroid update uses the original materialized `x_sorted` path below K=256 because contiguous reads beat indexed random row loads there. For fp16 D=128/K>=256, `centroid_update_sorted_indexed` consumes the sorted permutation directly and avoids materializing the full `(B,N,D)` `x_sorted` copy, which wins on med/big/huge/mega after shared-index caching.
-- The sorted-update path trusts `torch.sort` to preserve the already-int32 cluster-id dtype and only calls `.contiguous()` on `sorted_ids`; the old `.to(torch.int32)` was redundant in the hot wrapper.
-- The indexed mega update caches each CTA's 256 sorted row indices in shared memory before the feature loop. That avoids rereading the same global `sorted_idx` value from all 128 feature threads in the run accumulator.
-- The D=128 raw assign path now has N_TILES=1/2/4 specializations. Default routing keeps N_TILES=2 for med/big/huge and uses N_TILES=4 for the K>=8192 mega bucket, where 10-iter quality timing improved from 65.86 ms forced-N2 to 64.61 ms auto-N4 on the same binary.
+The current optimized D set is `1..16, 64, 96, 128, 192, 224, 256, 320, 384`.
+Other multiples of 16 can still route through the generic SM80 fallback chain
+or the safe kernel, but they are not the primary tuning target.
 
-**Perf snapshot (RTX 4090 / sm_89, fp16, ASSIGN-step only, vs PyTorch fp16 einsum + argmin, median of 5)**:
+Iteration-loop optimizations in `flash_kmeans_cuda/kmeans.py`:
 
-| Shape (B, N, K, D) | our_ms | TFLOPS | torch_ms | speedup |
-|---|---|---|---|---|
-| 1, 8K, 128, 64 (small) | 0.0067 | 20.2 | 0.088 | **13.1×** |
-| 1, 32K, 256, 128 (med) | 0.029 | 75 | 0.25 | **8.9×** † |
-| 1, 131K, 2048, 128 (big / SVG2) | 0.57 | 120 | 11.2 | **19.7×** |
-| 1, 262K, 4096, 128 (huge) | 2.23 | 123 | 44.5 | **20.0×** |
+- skips shift computation when `tol <= 0` and `verbose=False`;
+- reuses assignment, sum, count, and centroid buffers across iterations;
+- skips `x_sq` materialization for the fp16 D=128 raw-distance path when the
+  selected assignment kernel cannot read it;
+- uses indexed centroid update for fp16 D=128 and `K>=256` to avoid
+  materializing a full sorted copy of `x`.
 
-† Med fluctuates between 8.5× and 13× depending on cuBLAS algo selection in torch's matmul; our_ms is stable. On a warm GPU the run-to-run variance in `torch_ms` masks per-experiment kernel improvements.
+PTX wrappers live in `csrc/common/ptx.cuh`; architecture guards live in
+`csrc/common/arch.cuh`.
 
-**vs Triton (assign-only, larger dataset)**:
-
-| Shape | our TFLOPS | Triton TFLOPS | ratio |
-|---|---|---|---|
-| med (N=32K, K=256) | 93 | 39 | **2.36×** |
-| big (N=131K, K=2048, SVG2) | 114 | 124 | 0.92× |
-| huge (N=262K, K=4096) | 127 | 133 | 0.96× |
-| mega (N=524K, K=8192) | 131 | 133 | 0.98× |
-
-We hit 73-78% of fp16 peak (165 TFLOPS theoretical); Triton hits 79-84%. The 5-9% gap on large compute-bound shapes is fundamental — both kernels saturate the tensor cores. **10× Triton is unattainable** when both kernels approach hardware peak; the realistic ceiling is ~1.0–1.2×. We win on med because Triton's autotune isn't tuned for small shapes on Ada.
-
-**vs Triton (end-to-end `batch_kmeans_Euclid`, max_iters=1, fp16 D=128, exp67):**
-
-| Shape | our ms/iter | Triton ms/iter | speedup |
-|---|---:|---:|---:|
-| med (N=32K, K=256) | 0.176 | 0.580 | **3.30×** |
-| big (N=131K, K=2048) | 0.603 | 1.130 | **1.87×** |
-| huge (N=262K, K=4096) | 1.683 | 3.183 | **1.89×** |
-| mega (N=524K, K=8192) | 6.38 | 10.97 | **1.72×** |
-
-Big shape sustains ~73% of the 4090's fp16 mma peak (165 TFLOPS). Started the pytorch-comparison auto-tune at 17.8× speedup; landed at 19.7× on big and 20.0× on huge. Wins:
-1. **fp16 accumulator** (`mma.f16.f16.f16`): 2× tensor-core throughput on Ada vs fp32 acc. Per-atom acc is 2 packed-fp16 regs/thread (vs 4 fp32). Acc is unpacked to fp32 in the epilogue's distance compute.
-2. **8-warp wide tile preferred for K≥128**: 2 warps/scheduler under SMEM-bound 1-CTA/SM occupancy.
-3. **BLOCK_K=128 2-stage** (preferred when SMEM allows): biggest K-chunk halves chunk count, longer per-warp mma queue. Falls back to BLOCK_K=96 (87 KB SMEM) when D=128 forces tighter fit.
-4. **Tile dispatch chain**: `widek128_2_w8 → widek96_2_w8 → wide_3_w8 → wide_3_w4 → wide_2_w4 → narrow_4 → deep_2_w4`. Picks the largest that fits the device's per-block SMEM.
-5. **Compile-time async `c_sq` copy for K>=256**: large enough K launches a distinct kernel variant that copies full `c_sq` tiles through `cp.async` with the centroid tile; the final partial K chunk uses the vectorized store path to avoid out-of-bounds 16B async copies. Full K chunks skip per-candidate K-bound checks in the epilogue, and full N tiles skip row-validity checks. For D=128 and K>=256, the hot BK=96/N_TILES={1,2,4} tile uses a D-specialized raw-distance kernel so D-loop/address math constant-folds and `x_sq` is omitted from the argmin score because it is constant across centroids for each row. L2 access-policy persistence for centroids and BK80 were tested and regressed.
-- `csrc/update/update_sorted.cu` — sorted-chunk centroid accumulator. Caller (`flash_kmeans_cuda/ops.py`) does `torch.sort` on cluster_ids per batch, gathers x rows, then this kernel walks BLOCK_N=256 sorted tokens per CTA emitting one atomicAdd per run × BLOCK_D feature chunks. Output: fp32 sums + int32 counts.
-- `csrc/update/update_finalize.cu` — `new[b,k] = where(count > 0, sums / count, old)` cast to compute dtype. Trivial 1D grid.
-
-Build: `setup.py` invokes `torch.utils.cpp_extension.CUDAExtension`, emitting `-gencode` flags for sm_80/86/89/90/100/120. Hopper wgmma (Phase B) will compile a `assign_sm90.cu` with `-arch=sm_90a` only.
-
-PTX wrappers (`csrc/common/ptx.cuh`): `cp.async`, `ldmatrix.x4` and `.trans`, `mma.sync.m16n8k16` for fp16/bf16. Arch guards in `csrc/common/arch.cuh`.
+For active tuning notes and current benchmark tables, see
+`docs/superpowers/HANDOFF-d-size-tflops.md`.
 
 ### Triton reference (`third_party/flash-kmeans/`)
 

@@ -23,6 +23,9 @@ namespace assign {
 
 // Wide tiles, BLOCK_N=128, BLOCK_K=128.
 constexpr Variant V_WIDEK128_W8         = make_variant<128, 128, 8, 2, 1>("widek128_w8");
+constexpr Variant V_WIDEK128_W8_D16     = make_variant<128, 128, 8, 2, 1,  16, true>("widek128_w8_d16");
+constexpr Variant V_WIDEK128_W8_N2_D16  = make_variant<128, 128, 8, 2, 2,  16, true>("widek128_w8_n2_d16");
+constexpr Variant V_WIDEK256_W8_D16     = make_variant<128, 256, 8, 2, 1,  16, true>("widek256_w8_d16");
 constexpr Variant V_WIDEK128_W8_D128    = make_variant<128, 128, 8, 2, 1, 128, true>("widek128_w8_d128");
 constexpr Variant V_WIDEK128_W8_N2      = make_variant<128, 128, 8, 2, 2>("widek128_w8_n2");
 constexpr Variant V_WIDEK128_W8_N2_D64  = make_variant<128, 128, 8, 2, 2,  64, true>("widek128_w8_n2_d64");
@@ -30,6 +33,27 @@ constexpr Variant V_WIDEK128_W8_N2_D96  = make_variant<128, 128, 8, 2, 2,  96, t
 constexpr Variant V_WIDEK128_W8_N2_D128 = make_variant<128, 128, 8, 2, 2, 128, true>("widek128_w8_n2_d128");
 constexpr Variant V_WIDEK128_W8_N4      = make_variant<128, 128, 8, 2, 4>("widek128_w8_n4");
 constexpr Variant V_WIDEK128_W8_N4_D128 = make_variant<128, 128, 8, 2, 4, 128, true>("widek128_w8_n4_d128");
+
+// Small-D padded tensor-core variants. D=3..15 are loaded into a zero-filled
+// D=16 SMEM tile, so the regular m16n8k16 path can run without changing the
+// MMA epilogue. D=3 uses fp32 accumulators because fp16 accumulation loses too
+// many near-neighbor ties in very low dimension. D=1 uses the sorted
+// one-dimensional exact safe path; D=2 stays on the exact scalar tiled path.
+constexpr Variant V_PAD16_WIDEK128_W8_D3_F32ACC = make_padded_d_variant<128, 128, 8, 2, 1,  3, 16, true, 0, SMEM_PAD, true>("pad16_widek128_w8_d3_f32acc");
+constexpr Variant V_PAD16_WIDEK256_W8_D4 = make_padded_d_variant<128, 256, 8, 2, 1,  4>("pad16_widek256_w8_d4");
+constexpr Variant V_PAD16_WIDEK256_W8_D5 = make_padded_d_variant<128, 256, 8, 2, 1,  5>("pad16_widek256_w8_d5");
+constexpr Variant V_PAD16_WIDEK256_W8_D6 = make_padded_d_variant<128, 256, 8, 2, 1,  6>("pad16_widek256_w8_d6");
+constexpr Variant V_PAD16_WIDEK256_W8_D7 = make_padded_d_variant<128, 256, 8, 2, 1,  7>("pad16_widek256_w8_d7");
+constexpr Variant V_PAD16_W8_D8         = make_padded_d_variant<128, 128, 8, 2, 1, 8>("pad16_w8_d8");
+constexpr Variant V_PAD16_W8_N2_D8      = make_padded_d_variant<128, 128, 8, 2, 2, 8>("pad16_w8_n2_d8");
+constexpr Variant V_PAD16_WIDEK256_W8_D8= make_padded_d_variant<128, 256, 8, 2, 1, 8>("pad16_widek256_w8_d8");
+constexpr Variant V_PAD16_WIDEK256_W8_D9 = make_padded_d_variant<128, 256, 8, 2, 1,  9>("pad16_widek256_w8_d9");
+constexpr Variant V_PAD16_WIDEK256_W8_D10= make_padded_d_variant<128, 256, 8, 2, 1, 10>("pad16_widek256_w8_d10");
+constexpr Variant V_PAD16_WIDEK256_W8_D11= make_padded_d_variant<128, 256, 8, 2, 1, 11>("pad16_widek256_w8_d11");
+constexpr Variant V_PAD16_WIDEK256_W8_D12= make_padded_d_variant<128, 256, 8, 2, 1, 12>("pad16_widek256_w8_d12");
+constexpr Variant V_PAD16_WIDEK256_W8_D13= make_padded_d_variant<128, 256, 8, 2, 1, 13>("pad16_widek256_w8_d13");
+constexpr Variant V_PAD16_WIDEK256_W8_D14= make_padded_d_variant<128, 256, 8, 2, 1, 14>("pad16_widek256_w8_d14");
+constexpr Variant V_PAD16_WIDEK256_W8_D15= make_padded_d_variant<128, 256, 8, 2, 1, 15>("pad16_widek256_w8_d15");
 
 // Wide tiles, BLOCK_N=128, BLOCK_K=96.
 constexpr Variant V_WIDEK96_W8          = make_variant<128,  96, 8, 2, 1>("widek96_w8");
@@ -189,6 +213,85 @@ constexpr PolicyRow kGenericFallback = {
 // existing if/else for the n_tiles_choice == 2 default path).
 // =========================================================================
 
+constexpr PolicyRow kD1 = {
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD2 = {
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD3 = {
+  &V_PAD16_WIDEK128_W8_D3_F32ACC,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD4 = {
+  &V_PAD16_WIDEK256_W8_D4,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD5 = {
+  &V_PAD16_WIDEK256_W8_D5,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD6 = {
+  &V_PAD16_WIDEK256_W8_D6,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD7 = {
+  &V_PAD16_WIDEK256_W8_D7,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD8 = {
+  &V_PAD16_WIDEK256_W8_D8, &V_PAD16_W8_D8, &V_PAD16_W8_N2_D8,
+  nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD9 = {
+  &V_PAD16_WIDEK256_W8_D9,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD10 = {
+  &V_PAD16_WIDEK256_W8_D10,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD11 = {
+  &V_PAD16_WIDEK256_W8_D11,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD12 = {
+  &V_PAD16_WIDEK256_W8_D12,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD13 = {
+  &V_PAD16_WIDEK256_W8_D13,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD14 = {
+  &V_PAD16_WIDEK256_W8_D14,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD15 = {
+  &V_PAD16_WIDEK256_W8_D15,
+  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+};
+
+constexpr PolicyRow kD16 = {
+  &V_WIDEK256_W8_D16, &V_WIDEK128_W8_D16, &V_WIDEK128_W8_N2_D16,
+  &V_WIDEK128_W8_N2, &V_WIDEK128_W8_N4, &V_WIDEK128_W8,
+  &V_WIDEK96_W8_N2, &V_WIDEK96_W8,
+};
+
 constexpr PolicyRow kD64 = {
   &V_WIDEK128_W8_N2_D64, &V_WIDEK128_W8_D64, &V_WIDEK96_W8_N2_D64,
   &V_WIDEK96_W8_D64, &V_WIDEK128_W8_N2, &V_WIDEK96_W8_N2,
@@ -253,7 +356,10 @@ constexpr PolicyRow kD384 = {
 // prefer_w8 boolean — captured implicitly by ordering w8 variants first).
 // kRowsN2 is the n_tiles_choice==2 default path (matches the legacy default).
 constexpr PolicyRow kRowsN2[N_D_IDX] = {
-  kD64, kD96, kD128, kD192, kD224, kD256, kD320, kD384, kGenericFallback,
+  kD1, kD2, kD3, kD4, kD5, kD6, kD7, kD8,
+  kD9, kD10, kD11, kD12, kD13, kD14, kD15, kD16,
+  kD64, kD96, kD128, kD192, kD224, kD256, kD320, kD384,
+  kGenericFallback,
 };
 
 // =========================================================================
@@ -272,8 +378,12 @@ constexpr PolicyRow kGeneric_N1 = {
 };
 
 constexpr PolicyRow kRowsN1[N_D_IDX] = {
-  kGeneric_N1, kGeneric_N1, kD128_N1, kGeneric_N1, kGeneric_N1,
+  kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
+  kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
   kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
+  kGeneric_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
+  kD128_N1, kGeneric_N1, kGeneric_N1, kGeneric_N1,
+  kGeneric_N1, kGeneric_N1, kGeneric_N1,
 };
 
 // =========================================================================
@@ -292,8 +402,12 @@ constexpr PolicyRow kGeneric_N4 = {
 };
 
 constexpr PolicyRow kRowsN4[N_D_IDX] = {
-  kGeneric_N4, kGeneric_N4, kD128_N4, kGeneric_N4, kGeneric_N4,
+  kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
+  kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
   kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
+  kGeneric_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
+  kD128_N4, kGeneric_N4, kGeneric_N4, kGeneric_N4,
+  kGeneric_N4, kGeneric_N4, kGeneric_N4,
 };
 
 VariantView static_policy(int /*dtype_idx*/, int d_idx, int /*k_bucket*/, int n_tiles_override) {

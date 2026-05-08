@@ -12,33 +12,13 @@
 
 #include <nanobind/nanobind.h>
 #include "nb_torch.h"
-#include <c10/cuda/CUDAStream.h>
-#include <cstdlib>
-#include <cstring>
 
-#include "assign/assign.h"
+#include "flash_kmeans_cuda.h"
 #include "update/update.h"
 
 namespace nb = nanobind;
 
 namespace {
-
-// Opt-out flag: force the safe (tensor-core-free) kernel for every dtype.
-// Used for A/B correctness debugging.
-bool force_safe_path() {
-  static const bool v = []() {
-    const char* s = std::getenv("FKC_ASSIGN_FORCE_SAFE");
-    if (!s) return false;
-    return std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0;
-  }();
-  return v;
-}
-
-bool can_use_sm80_path(const at::Tensor& x) {
-  const auto dtype = x.scalar_type();
-  return (dtype == at::kHalf || dtype == at::kBFloat16) &&
-      x.size(2) % 16 == 0;
-}
 
 at::Tensor euclid_assign(
     at::Tensor x,
@@ -46,28 +26,10 @@ at::Tensor euclid_assign(
     at::Tensor x_sq,
     at::Tensor c_sq,
     c10::optional<at::Tensor> out) {
-  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
-  int B = x.size(0);
-  int N = x.size(1);
-
-  at::Tensor cluster_ids;
   if (out.has_value()) {
-    cluster_ids = out.value();
-    TORCH_CHECK(cluster_ids.scalar_type() == at::kInt, "out must be int32");
-    TORCH_CHECK(cluster_ids.dim() == 2 && cluster_ids.size(0) == B &&
-                cluster_ids.size(1) == N,
-                "out must be (B, N) int32");
-  } else {
-    cluster_ids = at::empty({B, N},
-        at::TensorOptions().dtype(at::kInt).device(x.device()));
+    return fkc::euclid_assign_out(x, centroids, x_sq, c_sq, out.value());
   }
-
-  if (can_use_sm80_path(x) && !force_safe_path()) {
-    fkc::assign::launch_assign_sm80(x, centroids, x_sq, c_sq, cluster_ids);
-  } else {
-    fkc::assign::launch_assign_safe(x, centroids, x_sq, c_sq, cluster_ids);
-  }
-  return cluster_ids;
+  return fkc::euclid_assign(x, centroids, x_sq, c_sq);
 }
 
 void centroid_update_sorted(

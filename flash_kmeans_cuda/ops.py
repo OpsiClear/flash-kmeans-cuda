@@ -1,7 +1,8 @@
 """Thin Python wrappers around the C++/CUDA ops.
 
-Validates input contiguity and shapes Python-side so error messages are
-readable, and allocates output buffers when callers don't pass them.
+Normalizes CUDA tensors to contiguous storage, computes optional squared
+norms, and allocates output buffers when callers don't pass them. Shape,
+dtype, and device validation is shared with the C++ API in ``csrc/api.cpp``.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "flash_kmeans_cuda._C C++/CUDA extension is not available. "
-        "Run `pip install -e .` (or `uv run pip install -e .`) inside the "
-        "repository root to build it."
+        "Run `uv pip install -e . --no-build-isolation` inside the repository "
+        "root to build it."
     ) from e
 
 

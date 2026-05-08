@@ -1,162 +1,81 @@
 # flash-kmeans-cuda
 
-CUDA kernels for batched Euclidean K-Means, focused on the fp16 assignment hot
-path on NVIDIA GPUs. This project is a libtorch/PyTorch CUDA implementation that
-mirrors the public `flash-kmeans` Euclidean API while replacing the Triton
-assignment/update path with hand-written CUDA kernels.
+Version `0.1.0`.
 
-The current tuning target is RTX 4090 / Ada (`sm_89`), fp16, `D=128`, large
-`N` and `K`.
+CUDA kernels for batched Euclidean K-Means, focused on the assignment hot path
+on NVIDIA GPUs. The Python API mirrors the public Euclidean API from
+`flash-kmeans`, while the Euclidean assign/update/finalize loop is implemented
+with hand-written CUDA kernels and a libtorch/nanobind extension.
+
+The current development target is RTX 4090 / Ada (`sm_89`), Python 3.12,
+Torch 2.11, CUDA 13, fp16/bf16 Euclidean assignment over large `N` and `K`.
 
 ## Status
 
-This is an optimization-oriented CUDA port. The Euclidean fp16 path is the main
-supported fast path. Cosine, dot-product, and large-N CPU streaming are still
-provided by the original Triton project, not this CUDA port.
+This is an optimization-oriented CUDA port. The main supported fast path is
+Euclidean K-Means on CUDA tensors. Cosine, dot-product, and large-N CPU
+streaming remain in the upstream Triton project, not this CUDA port.
 
-Recent RTX 4090 fp16 results, median-style local runs:
+Current assignment coverage:
 
-| Shape `(B, N, K, D)` | Assign: CUDA | Assign: Triton | Assign Speedup |
-|---|---:|---:|---:|
-| `(1, 32K, 256, 128)` | 92 TFLOPS | 38 TFLOPS | 2.40x |
-| `(1, 131K, 2048, 128)` | 171 TFLOPS | 120 TFLOPS | 1.42x |
-| `(1, 262K, 4096, 128)` | 176 TFLOPS | 126 TFLOPS | 1.39x |
-| `(1, 524K, 8192, 128)` | 185 TFLOPS | 126 TFLOPS | 1.46x |
+- fp16/bf16 tensor-core path for `D=3..15` and multiples of 16.
+- Specialized small-D handling for `D=1..16`, including exact/safe fallback
+  paths where tensor-core tie behavior is too noisy.
+- Tuned policy rows for `D=64, 96, 128, 192, 224, 256, 320, 384`.
+- Generic safe fallback for fp32 and unsupported shapes.
+- Per-process in-memory autotuning over candidate kernel variants, enabled by
+  default.
+
+Current local RTX 4090 fp16 D=128 assign-only numbers, measured from this tree
+with `TORCH_CUDA_ARCH_LIST=8.9`:
+
+| Shape `(B, N, K, D)` | CUDA ms | CUDA TFLOPS | PyTorch ms | Speedup vs PyTorch |
+|---|---:|---:|---:|---:|
+| `(1, 32K, 256, 128)` | 0.0245 | 87.54 | 0.2829 | 11.53x |
+| `(1, 131K, 2048, 128)` | 0.4290 | 160.20 | 15.0723 | 35.14x |
+| `(1, 262K, 4096, 128)` | 1.5635 | 175.81 | 59.1482 | 37.83x |
+| `(1, 524K, 8192, 128)` | 6.3678 | 172.67 | n/a | n/a |
+
+Current local `N=32768, K=8192` D-sweep sample:
+
+| D | CUDA ms | CUDA TFLOPS |
+|---:|---:|---:|
+| 1 | 0.0592 | 9.07 |
+| 2 | 0.1117 | 9.61 |
+| 3 | 0.2118 | 7.60 |
+| 4 | 0.1086 | 19.77 |
+| 8 | 0.0934 | 46.01 |
+| 16 | 0.0888 | 96.72 |
+| 128 | 0.3935 | 174.66 |
+| 192 | 0.6267 | 164.49 |
+| 224 | 0.7311 | 164.50 |
+| 256 | 0.9468 | 145.16 |
+| 320 | 1.2132 | 141.61 |
+| 384 | 1.3629 | 151.27 |
+
+The D-sweep table is a single local sample. Re-run the commands below on a
+quiet GPU before treating small differences as kernel wins or regressions.
 
 End-to-end K-Means includes assignment, sorting, centroid update, and finalize,
-so speedups are lower and vary by shape:
-
-| Shape `(B, N, K, D)` | CUDA ms/iter | Triton ms/iter | Speedup |
-|---|---:|---:|---:|
-| `(1, 32K, 256, 128)` | 0.129 | 0.508 | 3.94x |
-| `(1, 131K, 2048, 128)` | 0.489 | 1.056 | 2.16x |
-| `(1, 262K, 4096, 128)` | 1.667 | 2.786 | 1.67x |
-| `(1, 524K, 8192, 128)` | 6.179 | 9.157 | 1.48x |
-
-Quality checks compare final objective/inertia, centroid drift, and label
-disagreement against the Triton reference. The latest sampled exact inertia
-deltas were within about `+/-0.03%` on the large fp16 shapes.
-
-## Design
-
-The implementation has three layers.
+so speedups are lower and vary by shape. Use the benchmark commands below for
+numbers on your exact GPU, driver, CUDA toolkit, and D/K mix.
 
 ## Repository Layout
 
 - `flash_kmeans_cuda/`: Python package and CUDA/C++ sources.
-- `benchmarks/`: assign, end-to-end, and quality comparison scripts.
-- `tests/`: CUDA correctness and shape coverage.
-- `scripts/windows/`: local Windows build, benchmark, and profiling helpers.
+- `flash_kmeans_cuda/csrc/api.cpp`: shared C++ API validation and dispatch.
+- `flash_kmeans_cuda/csrc/bindings.cpp`: nanobind Python adapter.
+- `flash_kmeans_cuda/csrc/assign/`: assignment kernels, policy table, and
+  autotuner.
+- `flash_kmeans_cuda/csrc/update/`: sorted centroid update and finalize kernels.
+- `benchmarks/`: assign, end-to-end, D-sweep, and quality comparison scripts.
+- `tests/`: CUDA correctness, dispatch, autotune, shape, and dtype coverage.
+- `scripts/windows/`: Windows environment setup, build, benchmark, and profiling
+  helpers.
 - `docs/`: C++ shared-library and maintainer notes.
-- `cmake/`: CMake package config template.
-- `third_party/flash-kmeans`: upstream Triton reference submodule.
+- `third_party/flash-kmeans`: upstream Triton reference implementation.
 
-### Python Driver
-
-`flash_kmeans_cuda/kmeans.py` provides:
-
-```python
-from flash_kmeans_cuda import batch_kmeans_Euclid
-```
-
-The public shape convention is `(B, N, D)` for points and `(B, K, D)` for
-centroids. The loop mirrors the original Triton implementation:
-
-1. compute centroid norms
-2. assign each point to its nearest centroid
-3. sort labels
-4. accumulate centroid sums/counts
-5. finalize new centroids
-
-The loop preallocates buffers across iterations, skips centroid-shift work when
-`tol <= 0`, and skips `x_sq` setup for the D=128 fp16 raw-distance assignment
-path where `x_sq` is row-constant and cannot affect `argmin`.
-
-### CUDA Kernels
-
-`flash_kmeans_cuda/csrc/assign/assign_sm80.cu` is the main tensor-core
-assignment kernel for fp16/bf16 on Ampere+ GPUs.
-
-Key points:
-
-- `mma.sync.m16n8k16` tensor-core tiles.
-- fp16 accumulator path for fp16 input on Ada.
-- `ldmatrix.x4` loads for both operands.
-- `cp.async` staging of point and centroid tiles into shared memory.
-- fused min-over-K reduction in registers, so the cross-product matrix is never
-  materialized.
-- D=128 raw-distance specialization for `K>=256`.
-- persistent N-tile variants; default keeps `N_TILES=2` for med/big/huge and
-  routes mega `K>=8192` to `N_TILES=4`.
-
-`assign_safe.cu` is the non-tensor-core fallback for fp32 or unsupported shapes.
-
-`update_sorted.cu` accumulates centroid sums/counts from sorted cluster IDs. For
-fp16 D=128 and `K>=256`, the indexed update path consumes the sorted
-permutation directly and avoids materializing a full sorted copy of `x`.
-
-`update_finalize.cu` computes `new_centroid = sum / count`, preserving old
-centroids for empty clusters.
-
-### Build Surfaces
-
-There are two build surfaces:
-
-- Python extension: `setup.py` builds `flash_kmeans_cuda._C` with nanobind.
-- C++ shared library: `CMakeLists.txt` builds `flash_kmeans_cuda.dll` /
-  `libflash_kmeans_cuda.so` with a libtorch-based public API.
-
-The C++ API is declared in:
-
-```cpp
-#include <flash_kmeans_cuda/flash_kmeans_cuda.h>
-```
-
-It accepts and returns `at::Tensor` objects.
-
-## Installation
-
-### Python Development Install
-
-Requirements used for the current Windows development environment:
-
-- Python 3.12
-- CUDA toolkit compatible with the installed PyTorch wheel
-- PyTorch `2.11.*` CUDA wheel
-- MSVC Build Tools on Windows
-- `uv`
-
-From a fresh checkout:
-
-```powershell
-git clone --recursive https://github.com/OpsiClear/flash-kmeans-cuda.git
-cd flash-kmeans-cuda
-uv sync --locked --python 3.12
-```
-
-For an existing checkout, initialize the reference implementation submodule:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Build the Python extension on Windows:
-
-```powershell
-cmd /c scripts\windows\run_exp_t.bat
-```
-
-Run tests:
-
-```powershell
-uv run python -m pytest tests/ -q
-```
-
-## User Interface / API
-
-This project exposes library interfaces rather than a graphical UI.
-
-Python usage:
+## Python API
 
 ```python
 import torch
@@ -171,14 +90,129 @@ labels, centroids, n_iters = batch_kmeans_Euclid(
 )
 ```
 
-### C++ Shared Library
+Shape convention:
 
-The C++ build is documented in [docs/cpp_shared_library.md](docs/cpp_shared_library.md).
+- points: `(B, N, D)`
+- centroids: `(B, K, D)`
+- labels: `(B, N)` int32
+
+The loop mirrors the upstream Euclidean implementation:
+
+1. compute centroid norms
+2. assign each point to its nearest centroid
+3. sort labels
+4. accumulate centroid sums/counts
+5. finalize new centroids
+
+## Build Requirements
+
+Pinned project requirements:
+
+- Python `>=3.12,<3.13`
+- Torch `2.11.*` from the cu130 wheel index
+- CUDA toolkit compatible with the installed Torch wheel
+- `nanobind>=2.1`
+- `uv`
+
+Windows build requirements:
+
+- Visual Studio 2022 or Build Tools with MSVC C++ and Windows SDK
+- NVIDIA CUDA toolkit on PATH
+- PowerShell plus `cmd.exe`
+
+Linux build requirements:
+
+- GCC/Clang compatible with the installed CUDA toolkit
+- NVIDIA CUDA toolkit
+- A CUDA-capable PyTorch 2.11 cu130 install
+
+## Python Development Build
+
+From a fresh checkout:
+
+```powershell
+git clone --recursive https://github.com/OpsiClear/flash-kmeans-cuda.git
+cd flash-kmeans-cuda
+uv sync --locked --python 3.12
+```
+
+For an existing checkout:
+
+```powershell
+git submodule update --init --recursive
+uv sync --locked --python 3.12
+```
+
+Fast local Windows rebuild for RTX 4090 / `sm_89`:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e . --no-build-isolation"
+```
+
+Install `pytest` for local smoke and dispatch tests:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install pytest"
+```
+
+Rebuild after CUDA/C++ edits:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e . --no-build-isolation --reinstall-package flash-kmeans-cuda"
+```
+
+Portable/broad-arch builds can omit `TORCH_CUDA_ARCH_LIST`; `setup.py` then asks
+Torch/NVCC to build the configured architecture set. That is much slower than a
+single local-arch rebuild.
+
+Linux editable build:
+
+```bash
+uv sync --locked --python 3.12
+TORCH_CUDA_ARCH_LIST="8.9" uv pip install -e . --no-build-isolation
+```
+
+Run focused tests:
+
+```powershell
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/test_assign_dispatch_equiv.py -q"
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/test_shapes.py tests/test_dtypes.py tests/test_mma_optin.py -q"
+```
+
+Install the full `dev` extra when you need the upstream `flash-kmeans` oracle:
+
+```powershell
+$env:TORCH_CUDA_ARCH_LIST = "8.9"
+cmd /c 'scripts\windows\_setup_env.bat 1>nul 2>nul && uv pip install -e ".[dev]" --no-build-isolation'
+```
+
+The `dev` extra installs the upstream reference package. Triton wheels are
+unreliable on native Windows; if Triton cannot import, the upstream package can
+fall back to a torch-native backend. Use Linux/WSL for clean Triton comparisons.
+
+Run the full test suite after the required test dependencies are installed:
+
+```powershell
+cmd /c "scripts\windows\_setup_env.bat 1>nul 2>nul && uv run --no-sync python -m pytest tests/ -q"
+```
+
+Convenience Windows scripts:
+
+- `scripts\windows\run_exp.bat`: build, smoke tests, and PyTorch comparison.
+- `scripts\windows\run_exp_t.bat`: build, smoke tests, and Triton assign bench.
+- `scripts\windows\run_exp_d_sweep.bat`: build and D-sweep benchmark.
+
+## C++ Shared Library
+
+The C++ build is documented in
+[docs/cpp_shared_library.md](docs/cpp_shared_library.md).
 
 Short Windows build:
 
 ```powershell
-$env:TORCH_CUDA_ARCH_LIST = "8.9"
 $TorchPrefix = uv run python -c "import torch; print(torch.utils.cmake_prefix_path)"
 cmake -S . -B build-shared -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="$TorchPrefix" -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-shared --config Release --target flash_kmeans_cuda
@@ -203,31 +237,46 @@ Example C++ call:
 auto ids = fkc::euclid_assign(x, centroids, x_sq, c_sq);
 ```
 
-For Linux releases, prefer an explicit ABI/versioned artifact such as
-`linux-x86_64-torch2.11-cu13-sm80_86_89_90`. The shared library links against
-libtorch, so consumers must match the Torch/CUDA runtime family and C++ ABI.
+The C++ API accepts and returns `at::Tensor` objects. Consumers must match the
+Torch/CUDA runtime family used to build the DLL/shared object.
 
 ## Benchmarks
 
-Assign-only benchmark:
+Assign-only Triton comparison. This requires the upstream `flash-kmeans`
+reference package and a working Triton install:
 
 ```powershell
-uv run python benchmarks/bench_assign_vs_triton.py --shape mega --check-accuracy
+uv run --no-sync python benchmarks/bench_assign_vs_triton.py --shape mega --check-accuracy
 ```
 
-End-to-end benchmark:
+D sweep over the current tuning set:
 
 ```powershell
-uv run python benchmarks/bench_vs_triton.py --batch-size 1 --num-points 524288 --num-clusters 8192 --dim 128 --max-iters 1 --dtype fp16
+uv run --no-sync python benchmarks/bench_d_sweep.py --n 32768 --k 8192 --d 1 2 3 4 8 16 128 192 224 256 320 384 --rounds 30 --warmup 5 --outer 3
 ```
 
-Quality comparison over several iterations:
+PyTorch reference comparison:
 
 ```powershell
-uv run python benchmarks\quality_compare.py --shapes med big huge mega --iters 10 --dtype fp16 --sample-points 4096
+uv run --no-sync python benchmarks/bench_vs_pytorch.py --shape huge --rounds 20 --check-accuracy
 ```
 
-Available benchmark shapes in the local scripts:
+End-to-end comparison against upstream `flash_kmeans`. Verify imports if you
+need the upstream Triton kernels rather than its torch fallback:
+
+```powershell
+uv run --no-sync python benchmarks/bench_vs_triton.py --batch-size 1 --num-points 524288 --num-clusters 8192 --dim 128 --max-iters 1 --dtype fp16
+```
+
+Quality comparison over several iterations. This imports upstream
+`flash_kmeans`; without Triton it can exercise the upstream torch fallback
+instead of the Triton kernels:
+
+```powershell
+uv run --no-sync python benchmarks/quality_compare.py --shapes med big huge mega --iters 10 --dtype fp16 --sample-points 4096
+```
+
+Available assign benchmark shapes:
 
 | Name | Shape `(B, N, K, D)` |
 |---|---|
@@ -235,6 +284,24 @@ Available benchmark shapes in the local scripts:
 | `big` | `(1, 131072, 2048, 128)` |
 | `huge` | `(1, 262144, 4096, 128)` |
 | `mega` | `(1, 524288, 8192, 128)` |
+
+The PyTorch comparison scripts do not need Triton and work on the current
+Windows development environment.
+
+## Debug and Tuning Flags
+
+Environment flags used by the assignment launcher:
+
+- `FKC_ASSIGN_FORCE_SAFE=1`: force safe non-MMA assignment. Read per call.
+- `FKC_AUTOTUNE=0`: disable the in-memory autotuner and use static policy order.
+- `FKC_AUTOTUNE_VERBOSE=1`: print first-call probe timings.
+- `FKC_NTILES=1|2|4`: override persistent N-tile routing.
+- `FKC_NARROW=1`, `FKC_WIDE3=1`, `FKC_W4=1`: force developer tile variants.
+- `FKC_ASSIGN_DEEP_TILE=1`: force the deep tile fallback candidate list.
+- `FKC_DSLAB=1`: force the experimental D-slab path for supported large D.
+
+These flags are for benchmarking and correctness A/B checks, not stable public
+API.
 
 ## Release Automation
 
@@ -256,25 +323,11 @@ The release workflow builds:
 - Linux Python wheel for Python 3.12, Torch 2.11, CUDA 13.0
 - Linux C++ shared-library package for Torch 2.11, CUDA 13.0, `sm80/86/89/90`
 
-It then creates or updates the matching GitHub Release using `gh` and the
-repository `GITHUB_TOKEN`.
-
 Manual rebuild/publish:
 
 ```powershell
 gh workflow run release.yml -f tag=v0.1.0 -f publish=true
 ```
-
-## Debug and Tuning Flags
-
-Environment flags used by the launcher:
-
-- `FKC_ASSIGN_FORCE_SAFE=1`: force safe non-MMA assignment.
-- `FKC_NTILES=1|2|4`: override persistent N-tile routing.
-- `FKC_ASSIGN_DEEP_TILE=1`: force deep tile fallback.
-- `FKC_NARROW=1`, `FKC_WIDE3=1`, `FKC_W4=1`: experimental tile variants.
-
-These flags are mainly for benchmarking and correctness A/B checks.
 
 ## Relationship to Flash-KMeans
 

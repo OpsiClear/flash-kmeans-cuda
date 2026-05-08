@@ -1,8 +1,9 @@
-"""Side-by-side perf comparison vs Triton.
+"""Side-by-side perf comparison vs upstream flash_kmeans.
 
 Reuses the tile-grid pattern from
 ``third_party/flash-kmeans/examples/benchmark_backends.py`` and reports
-ms/iter and TFLOPS for each backend.
+ms/iter and TFLOPS for each backend. If the upstream package cannot import
+Triton, it may benchmark the upstream torch fallback instead.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ try:
     from flash_kmeans import batch_kmeans_Euclid as triton_kmeans
 except Exception as e:  # pragma: no cover
     triton_kmeans = None
-    print(f"WARN: Triton oracle unavailable: {e}")
+    print(f"WARN: upstream flash_kmeans unavailable: {e}")
 
 
 @dataclass

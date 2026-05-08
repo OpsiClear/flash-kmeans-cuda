@@ -4,7 +4,7 @@ Compiles a single torch CUDAExtension named ``flash_kmeans_cuda._C`` containing
 the Euclidean assign + sorted centroid update + finalize kernels.
 
 Python <-> C++ glue uses **nanobind** (not pybind11). nanobind ships a single
-``nb_combined.cc`` translation unit alongside its headers; we add it to the
+``nb_combined.cpp`` translation unit alongside its headers; we add it to the
 extension's source list and pass nanobind's include dir. A custom
 ``at::Tensor`` type caster lives in ``csrc/nb_torch.h`` since nanobind doesn't
 ship one for torch tensors.
@@ -99,6 +99,7 @@ def _common_cxx_flags() -> list[str]:
 
 
 sources = [
+    str(CSRC / "api.cpp"),
     str(CSRC / "bindings.cpp"),
     str(CSRC / "assign" / "assign_safe.cu"),
     str(CSRC / "assign" / "assign_sm80.cu"),
@@ -123,6 +124,7 @@ ext = CUDAExtension(
     name="flash_kmeans_cuda._C",
     sources=sources,
     include_dirs=include_dirs,
+    define_macros=[("FKC_BUILD_SHARED", None)],
     extra_compile_args={
         "cxx": _common_cxx_flags(),
         "nvcc": _common_nvcc_flags() + _gencode_flags(),

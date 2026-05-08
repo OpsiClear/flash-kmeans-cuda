@@ -113,7 +113,7 @@ def batch_kmeans_Euclid(
     init_centroids: Optional[torch.Tensor] = None,
     verbose: bool = False,
     *,
-    use_heuristic: bool = True,  # accepted for API parity, ignored
+    use_heuristic: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Batched K-Means clustering using Euclidean distance.
 
@@ -128,7 +128,8 @@ def batch_kmeans_Euclid(
         init_centroids: optional (B, K, D) initial centroids. If None, K random
             points from x are used per batch.
         verbose: print per-iter shift.
-        use_heuristic: ignored — the CUDA kernels don't autotune.
+        use_heuristic: ignored for API parity; assignment autotune is controlled
+            by the `FKC_AUTOTUNE` environment flag.
 
     Returns:
         (cluster_ids, centroids, n_iters_run)
@@ -136,7 +137,7 @@ def batch_kmeans_Euclid(
         centroids:   (B, K, D) compute dtype
         n_iters_run: int
     """
-    del use_heuristic  # parity with upstream signature
+    del use_heuristic  # API parity; FKC_AUTOTUNE controls assignment kernels.
 
     assert x.is_cuda, "flash_kmeans_cuda requires a CUDA input"
     assert x.dim() == 3, "x must be (B, N, D)"

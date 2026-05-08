@@ -75,6 +75,79 @@ __device__ __forceinline__ void mma_atom<__nv_bfloat16>(
   d1 = *reinterpret_cast<const uint32_t*>(&r1h);
 }
 
+template <bool FP32_ACC>
+struct AccRegs;
+
+template <>
+struct AccRegs<false> {
+  uint32_t top;
+  uint32_t bot;
+};
+
+template <>
+struct AccRegs<true> {
+  float top0;
+  float top1;
+  float bot0;
+  float bot1;
+};
+
+template <typename T>
+__device__ __forceinline__ void mma_accumulate(
+    AccRegs<false>& acc,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  mma_atom<T>(acc.top, acc.bot, a0, a1, a2, a3, b0, b1, acc.top, acc.bot);
+}
+
+template <typename T>
+__device__ __forceinline__ void mma_accumulate(
+    AccRegs<true>& acc,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1);
+
+template <>
+__device__ __forceinline__ void mma_accumulate<__half>(
+    AccRegs<true>& acc,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  ptx::mma_m16n8k16_fp16(
+      acc.top0, acc.top1, acc.bot0, acc.bot1,
+      a0, a1, a2, a3, b0, b1,
+      acc.top0, acc.top1, acc.bot0, acc.bot1);
+}
+
+template <>
+__device__ __forceinline__ void mma_accumulate<__nv_bfloat16>(
+    AccRegs<true>& acc,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  ptx::mma_m16n8k16_bf16(
+      acc.top0, acc.top1, acc.bot0, acc.bot1,
+      a0, a1, a2, a3, b0, b1,
+      acc.top0, acc.top1, acc.bot0, acc.bot1);
+}
+
+__device__ __forceinline__ void unpack_acc(
+    const AccRegs<false>& acc,
+    float& top0, float& top1, float& bot0, float& bot1) {
+  __half2 packed_top = *reinterpret_cast<const __half2*>(&acc.top);
+  __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc.bot);
+  top0 = __low2float(packed_top);
+  top1 = __high2float(packed_top);
+  bot0 = __low2float(packed_bot);
+  bot1 = __high2float(packed_bot);
+}
+
+__device__ __forceinline__ void unpack_acc(
+    const AccRegs<true>& acc,
+    float& top0, float& top1, float& bot0, float& bot1) {
+  top0 = acc.top0;
+  top1 = acc.top1;
+  bot0 = acc.bot0;
+  bot1 = acc.bot1;
+}
+
 // Issue cp.async copies for one tile of rows_max × D fp16 elts. SMEM is
 // laid out with stride D_SMEM (= D + SMEM_PAD) to eliminate bank conflicts;
 // gmem source is contiguous at stride D.
@@ -85,17 +158,31 @@ __device__ __forceinline__ void async_load_tile(
     const T* gmem_tile,           // (rows * D) source
     int rows,                     // valid row count (<= rows_max)
     int rows_max,                 // SMEM row capacity
-    int D, int D_SMEM) {
+    int D_LOAD, int D_TILE, int D_SMEM) {
   const int tid = threadIdx.x;
-  const int total_elts = rows_max * D;
+  const int total_elts = rows_max * D_TILE;
   const int elts_per_load = 16 / sizeof(T);   // 8 for fp16/bf16
+
+  if (D_LOAD != D_TILE && (D_LOAD % elts_per_load) != 0) {
+    for (int off = tid; off < total_elts; off += THREADS) {
+      int row = off / D_TILE;
+      int col = off % D_TILE;
+      T v{};
+      if (row < rows && col < D_LOAD) {
+        v = gmem_tile[(size_t)row * D_LOAD + col];
+      }
+      smem_tile[(size_t)row * D_SMEM + col] = v;
+    }
+    return;
+  }
+
   for (int off = tid * elts_per_load; off < total_elts;
        off += THREADS * elts_per_load) {
-    int row = off / D;
-    int col = off % D;
-    bool valid = row < rows;
+    int row = off / D_TILE;
+    int col = off % D_TILE;
+    bool valid = row < rows && (col + elts_per_load) <= D_LOAD;
     T* dst = smem_tile + (size_t)row * D_SMEM + col;
-    const T* src = gmem_tile + (size_t)row * D + col;
+    const T* src = gmem_tile + (size_t)row * D_LOAD + col;
     unsigned int dst_smem = ptx::cvta_to_shared(dst);
     ptx::cp_async_16B(dst_smem, src, valid);
   }
@@ -145,7 +232,7 @@ __device__ __forceinline__ void store_csq_tile(
 // time.
 template <typename T, int BLOCK_N, int BLOCK_K, int WARPS_PER_CTA, int PIPE_STAGES,
           int N_TILES_PER_CTA, bool ASYNC_CSQ, int D_FIXED,
-          bool RAW_DIST, int SMEM_PAD_TPL>
+          bool RAW_DIST, bool FP32_ACC, int SMEM_PAD_TPL>
 __global__ void __launch_bounds__(WARPS_PER_CTA * 32, 1)
 assign_sm80_kernel(
     const T* __restrict__ x,            // (B, N, D)
@@ -168,6 +255,7 @@ assign_sm80_kernel(
   const int warp_id = tid / kWarp;
   const int lane = tid % kWarp;
   const int D_TILE = (D_FIXED > 0) ? D_FIXED : D;
+  const int D_LOAD = D;
   const int D_SMEM = D_TILE + SMEM_PAD_TPL;
 
   // SMEM layout (with row-stride padding D_SMEM = D + SMEM_PAD):
@@ -222,8 +310,8 @@ assign_sm80_kernel(
     // so we skip — saves the latency of an extra cp.async + sync pair.
     if (n_tile == 0) {
       async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                         x + (size_t)pid_b * N * D_TILE + (size_t)n_start * D_TILE,
-                         n_count, BLOCK_N, D_TILE, D_SMEM);
+                         x + (size_t)pid_b * N * D_LOAD + (size_t)n_start * D_LOAD,
+                         n_count, BLOCK_N, D_LOAD, D_TILE, D_SMEM);
       ptx::cp_async_commit();
     }
 
@@ -233,8 +321,8 @@ assign_sm80_kernel(
       T* c_dst = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
       float* csq_dst = c_sq_smem + stage * BLOCK_K;
       async_load_tile<T, THREADS_PER_CTA>(c_dst,
-                         centroids + (size_t)pid_b * K * D_TILE + (size_t)k_start * D_TILE,
-                         k_count, BLOCK_K, D_TILE, D_SMEM);
+                         centroids + (size_t)pid_b * K * D_LOAD + (size_t)k_start * D_LOAD,
+                         k_count, BLOCK_K, D_LOAD, D_TILE, D_SMEM);
       static_assert((BLOCK_K % 4) == 0, "BLOCK_K must be a multiple of 4 for csq copy");
       const float* csq_src = c_sq + (size_t)pid_b * K + k_start;
       if constexpr (ASYNC_CSQ) {
@@ -297,16 +385,14 @@ assign_sm80_kernel(
     T* c_tile = c_smem + (size_t)stage * BLOCK_K * D_SMEM;
     float* c_sq_tile = c_sq_smem + stage * BLOCK_K;
 
-    // Per-warp accumulator: [M_ATOMS][N_ATOMS][2] packed fp16 regs/thread.
-    // Each u32 reg holds 2 fp16 values: d0 = (top-row col0, top-row col1),
-    // d1 = (bot-row col0, bot-row col1).
-    uint32_t acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP][2];
+    // Per-warp accumulator. Default path uses 2 packed fp16 regs/thread for
+    // Ada throughput; small-D exactness-sensitive variants can opt into fp32.
+    AccRegs<FP32_ACC> acc[M_ATOMS_PER_WARP][N_ATOMS_PER_WARP];
     #pragma unroll
     for (int m = 0; m < M_ATOMS_PER_WARP; ++m)
       #pragma unroll
       for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
-        acc[m][n][0] = 0u;
-        acc[m][n][1] = 0u;
+        acc[m][n] = {};
       }
 
     // Walk D in BLOCK_D=16 steps; each step does one mma per (m, n) atom.
@@ -350,7 +436,7 @@ assign_sm80_kernel(
       for (int n = 0; n < N_ATOMS_PER_WARP; n += 2) {
         // Lane addressing: bit 3 selects N-half (atoms n vs n+1 in this batch),
         // bit 4 selects K-half (d_off vs d_off+8). bits 0..2 select the row
-        // within the 8-row matrix (= lane%8 → centroid offset within atom).
+        // within the 8-row matrix (= lane%8 -> centroid offset within atom).
         int n_col = n * 8 + ldm_n_atom_off + ldm_row_in_half;
         unsigned int smem_addr = ptx::cvta_to_shared(
             c_tile + (size_t)n_col * D_SMEM + d_off + ldm_col_off);
@@ -367,11 +453,10 @@ assign_sm80_kernel(
       for (int m = 0; m < M_ATOMS_PER_WARP; ++m) {
         #pragma unroll
         for (int n = 0; n < N_ATOMS_PER_WARP; ++n) {
-          mma_atom<T>(
-              acc[m][n][0], acc[m][n][1],
+          mma_accumulate<T>(
+              acc[m][n],
               a_regs[m][0], a_regs[m][1], a_regs[m][2], a_regs[m][3],
-              b_regs[n][0], b_regs[n][1],
-              acc[m][n][0], acc[m][n][1]);
+              b_regs[n][0], b_regs[n][1]);
         }
       }
     }  // d-loop
@@ -395,12 +480,8 @@ assign_sm80_kernel(
             float cs0 = c_sq_tile[k_in_chunk_0];
             float cs1 = c_sq_tile[k_in_chunk_1];
 
-            __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
-            __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
-            float a_top0 = __low2float(packed_top);
-            float a_top1 = __high2float(packed_top);
-            float a_bot0 = __low2float(packed_bot);
-            float a_bot1 = __high2float(packed_bot);
+            float a_top0, a_top1, a_bot0, a_bot1;
+            unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
             if constexpr (RAW_DIST) {
               update_best(best[m * 2 + 0], cs0 - 2.0f * a_top0, k_global_0);
@@ -432,12 +513,8 @@ assign_sm80_kernel(
             float cs0 = c_sq_tile[k_in_chunk_0];
             float cs1 = c_sq_tile[k_in_chunk_1];
 
-            __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
-            __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
-            float a_top0 = __low2float(packed_top);
-            float a_top1 = __high2float(packed_top);
-            float a_bot0 = __low2float(packed_bot);
-            float a_bot1 = __high2float(packed_bot);
+            float a_top0, a_top1, a_bot0, a_bot1;
+            unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
             if (top_valid) {
               if constexpr (RAW_DIST) {
@@ -479,12 +556,8 @@ assign_sm80_kernel(
           float cs0 = c_sq_tile[k_in_chunk_0];
           float cs1 = c_sq_tile[k_in_chunk_1];
 
-          __half2 packed_top = *reinterpret_cast<const __half2*>(&acc[m][n][0]);
-          __half2 packed_bot = *reinterpret_cast<const __half2*>(&acc[m][n][1]);
-          float a_top0 = __low2float(packed_top);
-          float a_top1 = __high2float(packed_top);
-          float a_bot0 = __low2float(packed_bot);
-          float a_bot1 = __high2float(packed_bot);
+          float a_top0, a_top1, a_bot0, a_bot1;
+          unpack_acc(acc[m][n], a_top0, a_top1, a_bot0, a_bot1);
 
           if (top_valid) {
             if (k0_valid) {
@@ -525,6 +598,12 @@ assign_sm80_kernel(
     // Prefetch chunk_idx + PIPE_STAGES (if any) before waiting.
     int prefetch_idx = chunk_idx + PIPE_STAGES;
     if (prefetch_idx < num_k_chunks) {
+      if constexpr (PIPE_STAGES == 1) {
+        // S=1 reuses the same C/CSQ SMEM stage on every chunk. All warps must
+        // finish reading the current chunk before any warp starts overwriting
+        // that stage with the next cp.async batch.
+        __syncthreads();
+      }
       issue_c_chunk(prefetch_idx, prefetch_idx % PIPE_STAGES);
     }
     if (chunk_idx + 1 < num_k_chunks) {
@@ -549,8 +628,8 @@ assign_sm80_kernel(
     if (n_count_next > 0) {
       __syncthreads();
       async_load_tile<T, THREADS_PER_CTA>(x_smem,
-                         x + (size_t)pid_b * N * D_TILE + (size_t)n_start_next * D_TILE,
-                         n_count_next, BLOCK_N, D_TILE, D_SMEM);
+                         x + (size_t)pid_b * N * D_LOAD + (size_t)n_start_next * D_LOAD,
+                         n_count_next, BLOCK_N, D_LOAD, D_TILE, D_SMEM);
       ptx::cp_async_commit();
     }
   }

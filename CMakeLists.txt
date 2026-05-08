@@ -34,6 +34,8 @@ add_library(flash_kmeans_cuda SHARED
   "${FKC_CSRC}/api.cpp"
   "${FKC_CSRC}/assign/assign_safe.cu"
   "${FKC_CSRC}/assign/assign_sm80.cu"
+  "${FKC_CSRC}/assign/assign_policy.cu"
+  "${FKC_CSRC}/assign/assign_autotune.cu"
   "${FKC_CSRC}/update/update_sorted.cu"
   "${FKC_CSRC}/update/update_finalize.cu"
 )

@@ -35,11 +35,11 @@ using VariantView = ArrayView<const Variant* const>;
 // === Index/bucket helpers ====================================================
 
 constexpr int N_DTYPES   = 2;   // 0=fp16, 1=bf16
-constexpr int N_D_IDX    = 9;   // {64,96,128,192,224,256,320,384,OTHER}
+constexpr int N_D_IDX    = 25;  // {1..16,64,96,128,192,224,256,320,384,OTHER}
 constexpr int N_K_BUCKET = 5;   // tiny, small, med, large, mega
 constexpr int MAX_CAND   = 8;   // upper bound of candidates per cell
 
-constexpr int OTHER_D_IDX = 8;
+constexpr int OTHER_D_IDX = 24;
 
 inline int dtype_index_of(at::ScalarType t) {
   if (t == at::kHalf)      return 0;
@@ -49,14 +49,30 @@ inline int dtype_index_of(at::ScalarType t) {
 
 constexpr int d_index_of(int D) {
   switch (D) {
-    case  64: return 0;
-    case  96: return 1;
-    case 128: return 2;
-    case 192: return 3;
-    case 224: return 4;
-    case 256: return 5;
-    case 320: return 6;
-    case 384: return 7;
+    case   1: return 0;
+    case   2: return 1;
+    case   3: return 2;
+    case   4: return 3;
+    case   5: return 4;
+    case   6: return 5;
+    case   7: return 6;
+    case   8: return 7;
+    case   9: return 8;
+    case  10: return 9;
+    case  11: return 10;
+    case  12: return 11;
+    case  13: return 12;
+    case  14: return 13;
+    case  15: return 14;
+    case  16: return 15;
+    case  64: return 16;
+    case  96: return 17;
+    case 128: return 18;
+    case 192: return 19;
+    case 224: return 20;
+    case 256: return 21;
+    case 320: return 22;
+    case 384: return 23;
     default:  return OTHER_D_IDX;
   }
 }

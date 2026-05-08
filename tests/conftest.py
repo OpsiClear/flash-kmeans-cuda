@@ -32,12 +32,12 @@ def _cuda_required():
 
 
 def _try_import_triton_oracle():
-    """Import the upstream Triton implementation, or skip if unavailable."""
+    """Import the upstream flash_kmeans oracle, or skip if unavailable."""
     try:
         from flash_kmeans import batch_kmeans_Euclid as triton_kmeans
         return triton_kmeans
     except Exception as e:  # pragma: no cover
-        pytest.skip(f"flash_kmeans Triton oracle unavailable: {e}")
+        pytest.skip(f"flash_kmeans oracle unavailable: {e}")
 
 
 @pytest.fixture

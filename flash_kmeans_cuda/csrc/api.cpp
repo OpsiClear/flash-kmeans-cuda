@@ -10,18 +10,16 @@ namespace fkc {
 namespace {
 
 bool force_safe_path() {
-  static const bool v = []() {
-    const char* s = std::getenv("FKC_ASSIGN_FORCE_SAFE");
-    if (!s) return false;
-    return std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0;
-  }();
-  return v;
+  const char* s = std::getenv("FKC_ASSIGN_FORCE_SAFE");
+  if (!s) return false;
+  return std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0;
 }
 
 bool can_use_sm80_path(const at::Tensor& x) {
   const auto dtype = x.scalar_type();
+  const int64_t D = x.size(2);
   return (dtype == at::kHalf || dtype == at::kBFloat16) &&
-      x.size(2) % 16 == 0;
+      ((D >= 3 && D < 16) || (D % 16) == 0);
 }
 
 void validate_assign_inputs(
@@ -32,14 +30,39 @@ void validate_assign_inputs(
     const at::Tensor& cluster_ids) {
   TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
   TORCH_CHECK(centroids.is_cuda(), "centroids must be a CUDA tensor");
+  TORCH_CHECK(x_sq.is_cuda(), "x_sq must be a CUDA tensor");
+  TORCH_CHECK(c_sq.is_cuda(), "c_sq must be a CUDA tensor");
+  TORCH_CHECK(cluster_ids.is_cuda(), "cluster_ids must be a CUDA tensor");
   TORCH_CHECK(x.dim() == 3, "x must be (B, N, D)");
   TORCH_CHECK(centroids.dim() == 3, "centroids must be (B, K, D)");
+  TORCH_CHECK(x.scalar_type() == centroids.scalar_type(),
+              "x and centroids must share dtype");
   TORCH_CHECK(x_sq.scalar_type() == at::kFloat, "x_sq must be fp32");
   TORCH_CHECK(c_sq.scalar_type() == at::kFloat, "c_sq must be fp32");
   TORCH_CHECK(cluster_ids.scalar_type() == at::kInt, "cluster_ids must be int32");
+
+  const int64_t B = x.size(0);
+  const int64_t N = x.size(1);
+  const int64_t D = x.size(2);
+  const int64_t K = centroids.size(1);
+  TORCH_CHECK(centroids.size(0) == B && centroids.size(2) == D,
+              "centroids must be (B, K, D) matching x");
+  TORCH_CHECK(x_sq.dim() == 2 && x_sq.size(0) == B && x_sq.size(1) == N,
+              "x_sq must be (B, N) fp32 matching x");
+  TORCH_CHECK(c_sq.dim() == 2 && c_sq.size(0) == B && c_sq.size(1) == K,
+              "c_sq must be (B, K) fp32 matching centroids");
   TORCH_CHECK(cluster_ids.dim() == 2 && cluster_ids.size(0) == x.size(0) &&
               cluster_ids.size(1) == x.size(1),
               "cluster_ids must be (B, N) int32");
+  TORCH_CHECK(x.device() == centroids.device() &&
+              x.device() == x_sq.device() &&
+              x.device() == c_sq.device() &&
+              x.device() == cluster_ids.device(),
+              "all tensors must be on the same CUDA device");
+  TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
+              x_sq.is_contiguous() && c_sq.is_contiguous() &&
+              cluster_ids.is_contiguous(),
+              "all tensors must be contiguous");
 }
 
 }  // namespace

@@ -1,4 +1,4 @@
-"""Diff flash_kmeans_cuda against the Triton oracle.
+"""Diff flash_kmeans_cuda against the upstream flash_kmeans oracle.
 
 For each shape we run BOTH backends from the same init_centroids and compare:
 - cluster_ids: count of disagreements; allow up to 0.1% (Euclidean ties).

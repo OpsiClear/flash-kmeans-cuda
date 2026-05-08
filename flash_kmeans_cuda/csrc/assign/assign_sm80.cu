@@ -38,7 +38,8 @@
 // Notes:
 // - cluster_ids output is int32 to match the Triton signature.
 // - x_sq, c_sq are fp32 and broadcast in the in-register epilogue.
-// - D must be a multiple of 16 (covers the D=64/128/256 cases in the heuristic).
+// - D must be 3..15 or a multiple of 16. D=3..15 are zero-padded to a D=16
+//   SMEM tile.
 // - Bank conflicts: scalar loads from a (BLOCK_N, D) row-major SMEM tile have
 //   conflicts when D is a power of 2. We accept this for now (correctness
 //   first); a future patch can pad the row stride.
@@ -77,8 +78,8 @@ void launch_assign_sm80(const at::Tensor& x,
   int K = centroids.size(1);
   TORCH_CHECK(centroids.size(0) == B && centroids.size(2) == D,
               "centroids must be (B, K, D) matching x");
-  TORCH_CHECK(D % BLOCK_D == 0,
-              "assign_sm80: D must be a multiple of 16 (got ", D, ")");
+  TORCH_CHECK((D >= 3 && D < BLOCK_D) || D % BLOCK_D == 0,
+              "assign_sm80: D must be 3..15 or a multiple of 16 (got ", D, ")");
   TORCH_CHECK(x.is_contiguous() && centroids.is_contiguous() &&
               x_sq.is_contiguous() && c_sq.is_contiguous() &&
               cluster_ids.is_contiguous(),
